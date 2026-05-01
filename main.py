@@ -71,7 +71,7 @@ EXPECTED_OVER05_HT = {0: 1.25, 5: 1.28, 10: 1.32, 15: 1.38, 20: 1.45,
                      25: 1.55, 30: 1.68, 35: 1.85, 40: 2.10, 45: 2.50}
 EXPECTED_OVER15_HT = {0: 2.10, 5: 2.15, 10: 2.22, 15: 2.32, 20: 2.45,
                      25: 2.65, 30: 2.90, 35: 3.20, 40: 3.60, 45: 4.20}
-EXPECTED_OVER25    = {0: 1.85, 25: 2.15, 45: 2.90, 70: 4.50, 80: 6.50,
+EXPECTED_NEXT_GOAL    = {0: 1.85, 25: 2.15, 45: 2.90, 70: 4.50, 80: 6.50,
                      85: 9.00, 88: 12.0, 90: 20.0}
 
 
@@ -108,21 +108,21 @@ RULES_CATALOG = [
     {"num": 1,   "name": "Early Draw Signal",      "action": "DRAW_UNDER", "desc": "Draw 1.57-1.66 + Over 1.83-2.10 between minute 21-25"},
     {"num": 2,   "name": "Frozen Over",            "action": "NO_ENTRY",   "desc": "Over stuck at 1.80-1.86 between minute 26-30"},
     {"num": 3,   "name": "Two Early Goals Trap",   "action": "TRAP",       "desc": "Over already 1.66-1.75 -- two early goals priced in"},
-    {"num": 4,   "name": "Over 2.10 Value",        "action": "GOAL",       "desc": "Over >= 2.10 between minute 30-34"},
+    {"num": 4,   "name": "Next Goal 2.10 Value",        "action": "GOAL",       "desc": "Next Goal odd >= 2.10 between minute 30-34"},
     {"num": 5,   "name": "1.66 Trap",              "action": "TRAP",       "desc": "Over hovering at exactly 1.66"},
     {"num": 6,   "name": "Pair Signal",            "action": "GOAL",       "desc": "Draw 1.61 + Over 1.90 -- both confirm goal pressure"},
     {"num": 7,   "name": "3rd Goal Moment",        "action": "GOAL",       "desc": "Over >= 2.15 between minute 65-70"},
     {"num": 8,   "name": "Market Shut",            "action": "NO_GOAL",    "desc": "Over >= 2.80 in minute 82+"},
     {"num": 11,  "name": "Early Drop Signal",      "action": "GOAL",       "desc": "Over <= 1.55 between minute 17-20"},
-    {"num": 12,  "name": "Opening 1.30 Rule",      "action": "GOAL",       "desc": "Match opened with Over 2.5 at 1.30"},
+    {"num": 12,  "name": "Opening 1.30 Rule",      "action": "GOAL",       "desc": "Match opened with Next Goal at 1.30"},
     {"num": 13,  "name": "1.57 Entry Point",       "action": "GOAL",       "desc": "Over 1.54-1.60"},
-    {"num": 14,  "name": "Duration HELD",          "action": "GOAL",       "desc": "Over 2.30-2.70 held same value 2+ minutes"},
+    {"num": 14,  "name": "Duration HELD",          "action": "GOAL",       "desc": "Next Goal odd 2.30-2.70 held same value 2+ minutes"},
     {"num": 15,  "name": "Duration REJECTED",      "action": "NO_GOAL",    "desc": "Over jumped within 30s -- rejected by market"},
     {"num": 16,  "name": "Sharp Drop Signal",      "action": "GOAL",       "desc": "Over dropped 0.15+ in last snapshot"},
     {"num": 101, "name": "HT Pressure 0.5",        "action": "GOAL",       "desc": "Over 0.5 HT below expected curve, minute 15-45"},
     {"num": 102, "name": "HT Pressure 1.5",        "action": "GOAL",       "desc": "Over 1.5 HT below expected curve"},
     {"num": 103, "name": "Late Game Pressure",     "action": "GOAL",       "desc": "Over below expected by 0.8+ in minute 80+"},
-    {"num": 104, "name": "Late Odd Sweet Spot",    "action": "GOAL",       "desc": "Over 2.7-3.5 between minute 85-93"},
+    {"num": 104, "name": "Late Odd Sweet Spot",    "action": "GOAL",       "desc": "Next Goal odd 2.7-3.5 between minute 85-93"},
     {"num": 200, "name": "High Market Pressure",   "action": "GOAL",       "desc": "Composite pressure score >= 60%"},
     # ---- Movement-based rules (v6) ----
     {"num": 300, "name": "Steady Real Drop",       "action": "STRONG_GOAL", "desc": "STEADY_DROP + REAL_DROP + movement_score>=70 -- the gold-standard goal signal"},
@@ -176,7 +176,7 @@ def _ensure_column(cur, table: str, column: str, ddl: str):
 
 # Bump this when you make schema changes. On boot, if the DB is on an older
 # version we drop legacy PapaGoal tables and rebuild from scratch.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _read_schema_version() -> int:
@@ -251,7 +251,7 @@ def init_db():
             score_home      INT DEFAULT 0,
             score_away      INT DEFAULT 0,
             status          TEXT,
-            opening_over25  NUMERIC(6,3),
+            opening_next_goal  NUMERIC(6,3),
             first_seen_at   TIMESTAMPTZ DEFAULT NOW(),
             last_updated_at TIMESTAMPTZ DEFAULT NOW()
         )""")
@@ -266,22 +266,28 @@ def init_db():
             home_ml                  NUMERIC(6,3),
             draw_ml                  NUMERIC(6,3),
             away_ml                  NUMERIC(6,3),
+            -- Primary market: Next Goal (Yes/Over)
+            next_goal                NUMERIC(6,3),
+            prev_next_goal           NUMERIC(6,3),
+            opening_next_goal        NUMERIC(6,3),
+            expected_next_goal       NUMERIC(6,3),
+            -- Diagnostic markets (recorded but not used by rules)
             over_25                  NUMERIC(6,3),
             under_25                 NUMERIC(6,3),
+            over_35                  NUMERIC(6,3),
+            -- HT markets (used by HT-pressure rules)
             over_05_ht               NUMERIC(6,3),
             over_15_ht               NUMERIC(6,3),
-            prev_over_25             NUMERIC(6,3),
-            opening_over_25          NUMERIC(6,3),
+            -- Snapshot meta
             direction                TEXT,
             held_seconds             INT DEFAULT 0,
             pressure                 NUMERIC(6,2),
-            expected_over25          NUMERIC(6,3),
             is_live                  BOOLEAN DEFAULT TRUE,
             goal_30s                 BOOLEAN,
             goal_60s                 BOOLEAN,
             goal_120s                BOOLEAN,
             goal_300s                BOOLEAN,
-            -- Movement engine fields (v6+)
+            -- Movement engine fields
             movement_pattern         TEXT,
             drop_type                TEXT,
             movement_score           INT,
@@ -332,10 +338,10 @@ def init_db():
             verdict         TEXT,
             confidence      NUMERIC(5,2),
             pressure_score  NUMERIC(5,2),
-            over_odd        NUMERIC(6,3),
+            next_goal_odd     NUMERIC(6,3),
             over_05_ht_odd  NUMERIC(6,3),
             over_15_ht_odd  NUMERIC(6,3),
-            opening_over    NUMERIC(6,3),
+            opening_ng NUMERIC(6,3),
             opening_draw    NUMERIC(6,3),
             opening_home    NUMERIC(6,3),
             opening_away    NUMERIC(6,3),
@@ -591,9 +597,9 @@ def parse_match_odds(item: dict) -> Optional[dict]:
         "minute": item.get("minute") if isinstance(item.get("minute"), int) else None,
         "score": _as_str(item.get("score") or ""),
         "home_ml": None, "draw_ml": None, "away_ml": None,
-        "over_25": None, "under_25": None,
+        "next_goal": None,                          # primary market
+        "over_25": None, "under_25": None, "over_35": None,  # diagnostic only
         "over_05_ht": None, "over_15_ht": None,
-        "over_35": None,
     }
 
     bookmakers = item.get("bookmakers") or {}
@@ -620,16 +626,10 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 out["draw_ml"] = _to_float(first.get("draw"))
                 out["away_ml"] = _to_float(first.get("away"))
 
-        # ----- Half-time 1X2 (captured for completeness, not currently used) -----
-        elif mn_upper in ("ML HT", "1X2 HT", "1ST HALF ML",
-                          "FIRST HALF ML", "MATCH WINNER HT"):
-            _log_market_once(market_name, True)
-            # not currently consumed by any rule -- placeholder
-
-        # ----- Full-time Over/Under -----
-        # OddsAPI calls this "Totals". Other providers call it "Over/Under".
-        # FT 0.5 / FT 1.5 lines are *not* the same as HT 0.5 / HT 1.5 -- HT
-        # comes from the dedicated half-time market below.
+        # ----- Full-time Over/Under (Totals) -----
+        # This is the goal-totals market (Over/Under 2.5/3.5 etc) -- NOT what
+        # PapaGoal uses. We capture it for diagnostics only, since the Next
+        # Goal market is the one that drives all our rules.
         elif mn_upper in ("TOTALS", "OVER/UNDER", "TOTAL GOALS",
                           "GOALS OVER/UNDER", "MATCH TOTALS"):
             _log_market_once(market_name, True)
@@ -643,10 +643,37 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 ov = _to_float(entry.get("over"))
                 un = _to_float(entry.get("under"))
                 if abs(line - 2.5) < 0.01:
-                    out["over_25"] = ov
+                    out["over_25"] = ov          # diagnostic only
                     out["under_25"] = un
                 elif abs(line - 3.5) < 0.01:
                     out["over_35"] = ov
+
+        # ----- Next Goal market  (THE PRIMARY MARKET FOR PAPAGOAL) -----
+        # "Will another goal be scored?" odds. OddsAPI may ship this under
+        # several names; we cover the common ones.
+        elif mn_upper in ("NEXT GOAL", "TO SCORE NEXT", "NEXT TEAM TO SCORE",
+                          "NEXT GOALSCORER MARKET", "NEXTGOAL", "GOAL MARKET",
+                          "WILL THERE BE ANOTHER GOAL", "ANOTHER GOAL"):
+            _log_market_once(market_name, True)
+            # The odds list usually has either:
+            #   {"home": "1.85", "draw": "5.20", "away": "2.40"}  -- 3-way next-scorer
+            #   {"yes": "1.85", "no": "2.10"}                     -- 2-way "another goal?"
+            #   {"over": "1.85", "under": "2.10"}                 -- some providers
+            first = odds_list[0]
+            if isinstance(first, dict):
+                # Prefer 2-way "yes/no" form -- that's the goal-or-no-goal odd.
+                ng = (_to_float(first.get("yes"))
+                      or _to_float(first.get("over"))
+                      or _to_float(first.get("home"))   # fallback: home-scores-next
+                      or _to_float(first.get("any")))
+                if ng:
+                    out["next_goal"] = ng
+
+        # ----- Half-time 1X2 (captured for completeness, not currently used) -----
+        elif mn_upper in ("ML HT", "1X2 HT", "1ST HALF ML",
+                          "FIRST HALF ML", "MATCH WINNER HT"):
+            _log_market_once(market_name, True)
+            # not currently consumed by any rule -- placeholder
 
         # ----- Half-time Over/Under -----
         # OddsAPI ships this as "Totals HT". We want max=0.5 and max=1.5.
@@ -731,7 +758,7 @@ def lookup_football(idx: dict, home: str, away: str) -> Optional[dict]:
 
 
 # ============================================================================
-# MOVEMENT ENGINE  --  classifies how the Over 2.5 odd has been moving
+# MOVEMENT ENGINE  --  classifies how the Next Goal odd has been moving
 # ============================================================================
 # Adapted from the base44 v1 engine. The idea: a snapshot's value alone is
 # not enough -- the *pattern* of recent movement tells us whether we're
@@ -746,13 +773,13 @@ def lookup_football(idx: dict, home: str, away: str) -> Optional[dict]:
 #   UNKNOWN      -> too few samples
 #
 # A signal is much stronger when accompanied by REAL_DROP than when it's just
-# "Over 2.5 is at 1.85 in minute 30".
+# "Next Goal is at 1.85 in minute 30".
 
 MOVEMENT_BUFFER_SECONDS = 180  # look at the last 3 minutes of snapshots
 
 
 def _build_movement_buffer(snaps: list) -> list:
-    """snaps is a list of (captured_at_dt, over_25_float) tuples, OLDEST first.
+    """snaps is a list of (captured_at_dt, next_goal_float) tuples, OLDEST first.
     Returns a list of dicts with delta vs previous, direction, time_since_prev."""
     out = []
     for i, (ts, odd) in enumerate(snaps):
@@ -899,7 +926,7 @@ def _classify_drop_type(buf: list, metrics: dict, pattern: str) -> str:
 def fetch_movement_buffer(cur, match_id: int) -> list:
     """Pull the snapshots for a match in the last MOVEMENT_BUFFER_SECONDS."""
     cur.execute("""
-        SELECT captured_at, over_25
+        SELECT captured_at, next_goal
           FROM odds_snapshots
          WHERE match_id = %s
            AND captured_at >= NOW() - (%s || ' seconds')::interval
@@ -936,18 +963,18 @@ def evaluate_rules(snap: dict, prev: Optional[dict], opening: Optional[dict]) ->
     """Run all rules against the latest snapshot. Returns a list of signals.
 
     snap / prev / opening fields used:
-        minute, over_25, draw_ml, home_ml, away_ml, over_05_ht, over_15_ht,
+        minute, next_goal, draw_ml, home_ml, away_ml, over_05_ht, over_15_ht,
         held_seconds (snap only), direction (snap only)
     """
     signals = []
     minute     = snap.get("minute")
-    over       = snap.get("over_25")
+    over       = snap.get("next_goal")
     draw       = snap.get("draw_ml")
     over05_ht  = snap.get("over_05_ht")
     over15_ht  = snap.get("over_15_ht")
     held       = snap.get("held_seconds", 0)
-    prev_over  = (prev or {}).get("over_25") if prev else None
-    open_over  = (opening or {}).get("over_25") if opening else None
+    prev_over  = (prev or {}).get("next_goal") if prev else None
+    open_over  = (opening or {}).get("next_goal") if opening else None
 
     if minute is None:
         return signals
@@ -971,9 +998,9 @@ def evaluate_rules(snap: dict, prev: Optional[dict], opening: Optional[dict]) ->
     if over and 1.66 <= over <= 1.75 and minute >= 15:
         add(3, "Two Early Goals Trap", "TRAP", 60)
 
-    # --- Rule 4: Over 2.10 Value ---
+    # --- Rule 4: Next Goal 2.10 Value ---
     if over and 30 <= minute <= 34 and over >= 2.10:
-        add(4, "Over 2.10 Value", "GOAL", 70)
+        add(4, "Next Goal 2.10 Value", "GOAL", 70)
 
     # --- Rule 5: 1.66 Trap ---
     if over and abs(over - 1.66) < 0.02 and minute >= 20:
@@ -1034,7 +1061,7 @@ def evaluate_rules(snap: dict, prev: Optional[dict], opening: Optional[dict]) ->
 
     # --- Rule 103: Late Game Pressure ---
     if over and minute >= 80:
-        exp = get_expected_odd(EXPECTED_OVER25, minute)
+        exp = get_expected_odd(EXPECTED_NEXT_GOAL, minute)
         if exp and (exp - over) >= 0.80:
             pr = calculate_pressure(over, exp)
             add(103, "Late Game Pressure", "GOAL", min(95, 55 + pr / 2),
@@ -1119,15 +1146,15 @@ def upsert_match(cur, parsed: dict, fb_data: Optional[dict]) -> Optional[int]:
     score_away = (fb_data or {}).get("score_away", 0) or 0
 
     cur.execute(
-        "SELECT id, opening_over25, score_home, score_away FROM matches WHERE event_id = %s",
+        "SELECT id, opening_next_goal, score_home, score_away FROM matches WHERE event_id = %s",
         (parsed["event_id"],),
     )
     row = cur.fetchone()
     if row:
-        match_id, opening_over25, prev_sh, prev_sa = row
-        new_opening = opening_over25
-        if not opening_over25 and parsed.get("over_25"):
-            new_opening = parsed["over_25"]
+        match_id, opening_next_goal, prev_sh, prev_sa = row
+        new_opening = opening_next_goal
+        if not opening_next_goal and parsed.get("next_goal"):
+            new_opening = parsed["next_goal"]
         cur.execute("""
             UPDATE matches
                SET league = COALESCE(NULLIF(%s,''), league),
@@ -1135,35 +1162,35 @@ def upsert_match(cur, parsed: dict, fb_data: Optional[dict]) -> Optional[int]:
                    score_home = %s,
                    score_away = %s,
                    status = 'live',
-                   opening_over25 = COALESCE(opening_over25, %s),
+                   opening_next_goal = COALESCE(opening_next_goal, %s),
                    last_updated_at = NOW()
              WHERE id = %s
         """, (parsed.get("league", ""), minute, score_home, score_away,
               new_opening, match_id))
-        return match_id, prev_sh, prev_sa, opening_over25
+        return match_id, prev_sh, prev_sa, opening_next_goal
     else:
         cur.execute("""
             INSERT INTO matches (event_id, league, home, away, minute,
-                                 score_home, score_away, status, opening_over25)
+                                 score_home, score_away, status, opening_next_goal)
             VALUES (%s,%s,%s,%s,%s,%s,%s,'live',%s)
             RETURNING id
         """, (parsed["event_id"], parsed.get("league", ""), parsed["home"],
               parsed["away"], minute, score_home, score_away,
-              parsed.get("over_25")))
+              parsed.get("next_goal")))
         match_id = cur.fetchone()[0]
-        return match_id, 0, 0, parsed.get("over_25")
+        return match_id, 0, 0, parsed.get("next_goal")
 
 
 def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
-                  opening_over: Optional[float], minute: Optional[int]) -> dict:
+                  opening_ng: Optional[float], minute: Optional[int]) -> dict:
     """Insert one snapshot row, returning the snap dict (for rule eval).
 
     The movement analysis runs on the *previous* snapshots that already exist
     in the table (since this new row hasn't been inserted yet). We then store
     the resulting pattern/drop_type alongside this new row -- so each snapshot
     is tagged with the movement pattern that was active going into it."""
-    over = parsed.get("over_25")
-    prev_over = prev_snap.get("over_25") if prev_snap else None
+    over = parsed.get("next_goal")
+    prev_over = prev_snap.get("next_goal") if prev_snap else None
     direction = _direction(prev_over, over)
 
     # held_seconds: roll forward if direction == FLAT
@@ -1171,7 +1198,7 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
     if prev_snap and direction == "FLAT":
         held = (prev_snap.get("held_seconds") or 0) + SCAN_INTERVAL_SEC
 
-    expected = get_expected_odd(EXPECTED_OVER25, minute) if minute is not None else None
+    expected = get_expected_odd(EXPECTED_NEXT_GOAL, minute) if minute is not None else None
     pressure = calculate_pressure(over, expected)
 
     # ---- Movement analysis on existing snapshots (before this one is saved) ----
@@ -1179,22 +1206,26 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
 
     cur.execute("""
         INSERT INTO odds_snapshots
-            (match_id, minute, home_ml, draw_ml, away_ml, over_25, under_25,
-             over_05_ht, over_15_ht, prev_over_25, opening_over_25,
-             direction, held_seconds, pressure, expected_over25, is_live,
+            (match_id, minute, home_ml, draw_ml, away_ml,
+             next_goal, prev_next_goal, opening_next_goal, expected_next_goal,
+             over_25, under_25, over_35, over_05_ht, over_15_ht,
+             direction, held_seconds, pressure, is_live,
              movement_pattern, drop_type, movement_score, total_changes_count,
              direction_consistency, longest_stable_duration, total_delta,
              avg_time_between_changes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,
+        VALUES (%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,
+                %s,%s,%s,%s,%s,
+                %s,%s,%s,TRUE,
                 %s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         match_id, minute,
         parsed.get("home_ml"), parsed.get("draw_ml"), parsed.get("away_ml"),
-        over, parsed.get("under_25"),
-        parsed.get("over_05_ht"), parsed.get("over_15_ht"),
-        prev_over, opening_over,
-        direction, held, round(pressure, 2),
+        over, prev_over, opening_ng,
         round(expected, 3) if expected else None,
+        parsed.get("over_25"), parsed.get("under_25"), parsed.get("over_35"),
+        parsed.get("over_05_ht"), parsed.get("over_15_ht"),
+        direction, held, round(pressure, 2),
         movement["movement_pattern"], movement["drop_type"],
         movement["movement_score"], movement["total_changes_count"],
         movement["direction_consistency"], movement["longest_stable_duration"],
@@ -1203,7 +1234,7 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
 
     return {
         "minute": minute,
-        "over_25": over,
+        "next_goal": over,
         "draw_ml": parsed.get("draw_ml"),
         "home_ml": parsed.get("home_ml"),
         "away_ml": parsed.get("away_ml"),
@@ -1222,7 +1253,7 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
 
 def get_prev_snapshot(cur, match_id: int) -> Optional[dict]:
     cur.execute("""
-        SELECT minute, over_25, draw_ml, home_ml, away_ml,
+        SELECT minute, next_goal, draw_ml, home_ml, away_ml,
                over_05_ht, over_15_ht, direction, held_seconds, pressure
           FROM odds_snapshots
          WHERE match_id = %s
@@ -1232,10 +1263,10 @@ def get_prev_snapshot(cur, match_id: int) -> Optional[dict]:
     row = cur.fetchone()
     if not row:
         return None
-    cols = ["minute", "over_25", "draw_ml", "home_ml", "away_ml",
+    cols = ["minute", "next_goal", "draw_ml", "home_ml", "away_ml",
             "over_05_ht", "over_15_ht", "direction", "held_seconds", "pressure"]
     out = dict(zip(cols, row))
-    for k in ("over_25", "draw_ml", "home_ml", "away_ml",
+    for k in ("next_goal", "draw_ml", "home_ml", "away_ml",
               "over_05_ht", "over_15_ht", "pressure"):
         if out.get(k) is not None:
             out[k] = float(out[k])
@@ -1257,7 +1288,7 @@ def maybe_record_goal(cur, match_id: int, prev_sh: int, prev_sa: int,
     had = 0
     for col, secs in windows.items():
         cur.execute("""
-            SELECT minute, over_25, draw_ml, over_05_ht, over_15_ht,
+            SELECT minute, next_goal, draw_ml, over_05_ht, over_15_ht,
                    pressure, direction, held_seconds, captured_at
               FROM odds_snapshots
              WHERE match_id = %s
@@ -1270,7 +1301,7 @@ def maybe_record_goal(cur, match_id: int, prev_sh: int, prev_sa: int,
             had += 1
             payload[col] = {
                 "minute": row[0],
-                "over_25": float(row[1]) if row[1] is not None else None,
+                "next_goal": float(row[1]) if row[1] is not None else None,
                 "draw_ml": float(row[2]) if row[2] is not None else None,
                 "over_05_ht": float(row[3]) if row[3] is not None else None,
                 "over_15_ht": float(row[4]) if row[4] is not None else None,
@@ -1303,15 +1334,15 @@ def fire_signals(cur, match_id: int, snap: dict, parsed: dict,
         cur.execute("""
             INSERT INTO signals (
                 match_id, minute, rule_num, rule_name, verdict, confidence,
-                pressure_score, over_odd, over_05_ht_odd, over_15_ht_odd,
-                opening_over, opening_draw, opening_home, opening_away, details)
+                pressure_score, next_goal_odd, over_05_ht_odd, over_15_ht_odd,
+                opening_ng, opening_draw, opening_home, opening_away, details)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
         """, (match_id, minute, sig["rule_num"], sig["rule_name"],
               sig["verdict"], sig["confidence"], snap.get("pressure"),
-              snap.get("over_25"), snap.get("over_05_ht"),
+              snap.get("next_goal"), snap.get("over_05_ht"),
               snap.get("over_15_ht"),
-              opening.get("over_25"), opening.get("draw_ml"),
+              opening.get("next_goal"), opening.get("draw_ml"),
               opening.get("home_ml"), opening.get("away_ml"),
               Json(sig.get("details", {}))))
         signal_id = cur.fetchone()[0]
@@ -1328,7 +1359,7 @@ def fire_signals(cur, match_id: int, snap: dict, parsed: dict,
                 INSERT INTO paper_trades
                     (signal_id, match_id, entry_odd, verdict, rule_name, minute_entry)
                 VALUES (%s,%s,%s,%s,%s,%s)
-            """, (signal_id, match_id, snap.get("over_25"), sig["verdict"],
+            """, (signal_id, match_id, snap.get("next_goal"), sig["verdict"],
                   sig["rule_name"], minute))
 
         SCANNER_STATS["signals_fired"] += 1
@@ -1462,7 +1493,7 @@ def scan_once():
                     fb = {"minute": parsed.get("minute"), "score": sc,
                           "score_home": sh, "score_away": sa}
 
-                match_id, prev_sh, prev_sa, opening_over = upsert_match(cur, parsed, fb)
+                match_id, prev_sh, prev_sa, opening_ng = upsert_match(cur, parsed, fb)
 
                 # Goal detection BEFORE saving the new snapshot
                 maybe_record_goal(cur, match_id, prev_sh or 0, prev_sa or 0,
@@ -1470,12 +1501,12 @@ def scan_once():
 
                 prev_snap = get_prev_snapshot(cur, match_id)
                 snap = save_snapshot(cur, match_id, parsed, prev_snap,
-                                     opening_over, fb["minute"])
+                                     opening_ng, fb["minute"])
                 SCANNER_STATS["snapshots_saved"] += 1
 
                 # Rules
                 opening = {
-                    "over_25": float(opening_over) if opening_over else None,
+                    "next_goal": float(opening_ng) if opening_ng else None,
                     "draw_ml": parsed.get("draw_ml"),
                     "home_ml": parsed.get("home_ml"),
                     "away_ml": parsed.get("away_ml"),
@@ -1656,10 +1687,10 @@ def claude_review_signal(signal_row: dict) -> str:
 
     # Compute the gap vs the expected curve so Claude can reason about it
     minute = signal_row.get("minute") or 0
-    over   = signal_row.get("over_odd")
+    over   = signal_row.get("next_goal_odd")
     o05    = signal_row.get("over_05_ht_odd")
     o15    = signal_row.get("over_15_ht_odd")
-    exp_25  = get_expected_odd(EXPECTED_OVER25, minute)
+    exp_25  = get_expected_odd(EXPECTED_NEXT_GOAL, minute)
     exp_05  = get_expected_odd(EXPECTED_OVER05_HT, minute) if minute <= 45 else None
     exp_15  = get_expected_odd(EXPECTED_OVER15_HT, minute) if minute <= 45 else None
 
@@ -1678,10 +1709,10 @@ PRESSURE SCORE: {signal_row.get('pressure_score')}
 RULE CONFIDENCE: {signal_row.get('confidence')}%
 
 ODDS SNAPSHOT:
-- Live Over 2.5:    {over}    (expected at this minute: {exp_25}, gap: {_gap(over, exp_25)})
+- Live Next Goal:    {over}    (expected at this minute: {exp_25}, gap: {_gap(over, exp_25)})
 - Over 0.5 HT:      {o05}     (expected: {exp_05}, gap: {_gap(o05, exp_05)})
 - Over 1.5 HT:      {o15}     (expected: {exp_15}, gap: {_gap(o15, exp_15)})
-- Opening Over 2.5: {signal_row.get('opening_over')}
+- Opening Next Goal: {signal_row.get('opening_ng')}
 - Opening Draw:     {signal_row.get('opening_draw')}
 
 YOUR TASK:
@@ -1729,8 +1760,8 @@ def _gather_pattern_data() -> dict:
             # Successful paper trades (signals that hit)
             cur.execute("""
                 SELECT pt.minute_entry, pt.entry_odd, pt.verdict, pt.rule_name,
-                       pt.profit_loss, s.over_odd, s.over_05_ht_odd, s.over_15_ht_odd,
-                       s.opening_over, s.pressure_score, m.league
+                       pt.profit_loss, s.next_goal_odd, s.over_05_ht_odd, s.over_15_ht_odd,
+                       s.opening_ng, s.pressure_score, m.league
                   FROM paper_trades pt
                   JOIN signals s ON s.id = pt.signal_id
                   JOIN matches m ON m.id = pt.match_id
@@ -1744,8 +1775,8 @@ def _gather_pattern_data() -> dict:
             # Failed paper trades (signals that missed)
             cur.execute("""
                 SELECT pt.minute_entry, pt.entry_odd, pt.verdict, pt.rule_name,
-                       pt.profit_loss, s.over_odd, s.over_05_ht_odd, s.over_15_ht_odd,
-                       s.opening_over, s.pressure_score, m.league
+                       pt.profit_loss, s.next_goal_odd, s.over_05_ht_odd, s.over_15_ht_odd,
+                       s.opening_ng, s.pressure_score, m.league
                   FROM paper_trades pt
                   JOIN signals s ON s.id = pt.signal_id
                   JOIN matches m ON m.id = pt.match_id
@@ -1769,8 +1800,8 @@ def _gather_pattern_data() -> dict:
             # No-goal examples: snapshots that had high pressure but no goal
             # within the next 5 minutes. These are "almost-traps".
             cur.execute("""
-                SELECT s.minute, s.over_25, s.over_05_ht, s.over_15_ht,
-                       s.opening_over_25, s.expected_over25, s.pressure,
+                SELECT s.minute, s.next_goal, s.over_05_ht, s.over_15_ht,
+                       s.opening_next_goal, s.expected_next_goal, s.pressure,
                        s.direction, s.held_seconds, s.captured_at, m.league
                   FROM odds_snapshots s
                   JOIN matches m ON m.id = s.match_id
@@ -2091,10 +2122,10 @@ def page_live():
         with db_cursor(dict_rows=True) as cur:
             cur.execute("""
                 SELECT m.id, m.home, m.away, m.league, m.minute,
-                       m.score_home, m.score_away, m.opening_over25,
-                       s.over_25, s.draw_ml, s.over_05_ht, s.over_15_ht,
+                       m.score_home, m.score_away, m.opening_next_goal,
+                       s.next_goal, s.draw_ml, s.over_05_ht, s.over_15_ht,
                        s.direction, s.held_seconds, s.pressure,
-                       s.expected_over25, s.captured_at,
+                       s.expected_next_goal, s.captured_at,
                        s.movement_pattern, s.drop_type, s.movement_score
                   FROM matches m
              LEFT JOIN LATERAL (
@@ -2132,7 +2163,7 @@ def page_live():
           <td>{h['rule_name']}</td>
           <td><span class="tag {h['verdict']}">{h['verdict']}</span></td>
           <td class="right"><b>{h['confidence']}%</b></td>
-          <td class="right">{h['over_odd'] or '-'}</td>
+          <td class="right">{h['next_goal_odd'] or '-'}</td>
           <td class="right">{round(float(h['pressure_score']),1) if h['pressure_score'] else '-'}%</td>
           <td><a class="btn" href="/signals?id={h['id']}">analyze</a></td>
         </tr>""" for h in hot)
@@ -2143,8 +2174,8 @@ def page_live():
     if rows:
         match_rows = []
         for r in rows:
-            over = r['over_25']
-            exp = r['expected_over25']
+            over = r['next_goal']
+            exp = r['expected_next_goal']
             press = float(r['pressure'] or 0)
             press_pct = max(0, min(100, press))
             score = f"{r['score_home']}-{r['score_away']}"
@@ -2177,7 +2208,7 @@ def page_live():
               <td class="muted">{(r['league'] or '')[:24]}</td>
               <td class="center"><b>{r['minute'] or '-'}'</b><br><span class="muted">{score}</span></td>
               <td class="right"><b>{over or '-'}</b><br><span class="muted">exp {round(float(exp),2) if exp else '-'}</span></td>
-              <td class="right">{r['opening_over25'] or '-'}</td>
+              <td class="right">{r['opening_next_goal'] or '-'}</td>
               <td class="right">{r['draw_ml'] or '-'}</td>
               <td class="right">{r['over_05_ht'] or '-'}</td>
               <td class="right">{r['over_15_ht'] or '-'}</td>
@@ -2207,7 +2238,7 @@ def page_live():
       <h2>🔥 Hot Signals <span class="muted">last 15 min · confidence ≥ 65%</span></h2>
       <table>
         <tr><th></th><th>Match</th><th>Min</th><th>Rule</th><th>Verdict</th>
-            <th class="right">Conf.</th><th class="right">Over 2.5</th>
+            <th class="right">Conf.</th><th class="right">Next Goal</th>
             <th class="right">Pressure</th><th></th></tr>
         {hot_rows}
       </table>
@@ -2217,7 +2248,7 @@ def page_live():
       <h2>📡 Live Matches <span class="muted">sorted by pressure</span></h2>
       <table>
         <tr><th>Match</th><th>League</th><th class="center">Min · Score</th>
-            <th class="right">Over 2.5</th><th class="right">Open</th>
+            <th class="right">Next Goal</th><th class="right">Open</th>
             <th class="right">Draw</th><th class="right">Over 0.5 HT</th>
             <th class="right">Over 1.5 HT</th>
             <th>Direction</th><th>Movement</th><th>Pressure</th></tr>
@@ -2255,7 +2286,7 @@ def page_goals():
             d = g.get(window)
             if not d:
                 return "<td colspan='3' class='dim center'>—</td>"
-            ov = d.get("over_25")
+            ov = d.get("next_goal")
             press = d.get("pressure")
             direction = d.get("direction") or "-"
             return (f"<td class='right'>{ov if ov else '-'}</td>"
@@ -2419,7 +2450,7 @@ def page_signals():
         <td>{r['rule_name']}</td>
         <td><span class="tag {r['verdict']}">{r['verdict']}</span></td>
         <td class="right"><b>{r['confidence']}%</b></td>
-        <td class="right">{r['over_odd'] or '-'}</td>
+        <td class="right">{r['next_goal_odd'] or '-'}</td>
         <td class="right">{round(float(r['pressure_score']),1) if r['pressure_score'] else '-'}%</td>
         <td><a class="btn" href="/signals?id={r['id']}">Claude</a></td>
       </tr>""" for r in rows) or '<tr><td colspan="9" class="empty">No signals in the last 3 hours</td></tr>'
@@ -2431,7 +2462,7 @@ def page_signals():
       <table>
         <tr><th>Time</th><th>Match</th><th class="center">Min</th>
             <th>Rule</th><th>Verdict</th><th class="right">Conf.</th>
-            <th class="right">Over 2.5</th><th class="right">Pressure</th><th></th></tr>
+            <th class="right">Next Goal</th><th class="right">Pressure</th><th></th></tr>
         {sig_rows}
       </table>
     </div>"""
@@ -2615,6 +2646,59 @@ def health():
         "oddsapi": bool(ODDSPAPI_KEY),
         "markets_seen": sorted(_SEEN_MARKETS),
         "now": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/debug/markets")
+def debug_markets():
+    """Show raw OddsAPI response for the first live event we can find.
+    Useful for figuring out what markets and lines OddsAPI actually ships."""
+    if not ODDSPAPI_KEY:
+        return jsonify({"error": "ODDSPAPI_KEY not set"}), 500
+
+    events = fetch_oddsapi_events()
+    if not events:
+        return jsonify({"error": "no live events right now"}), 200
+
+    # Pick first event with a Bet365 quote
+    first_id = events[0].get("id") or events[0].get("eventId")
+    if not first_id:
+        return jsonify({"error": "no event id", "raw_events_sample": events[:1]}), 200
+
+    odds_data = fetch_oddsapi_odds([str(first_id)])
+    if not odds_data:
+        return jsonify({"error": "no odds returned", "event_id": first_id}), 200
+
+    raw = odds_data[0]
+    bookmakers = raw.get("bookmakers") or {}
+    bet365 = bookmakers.get("Bet365") or bookmakers.get("bet365") or []
+
+    # Build a clean inventory of every market name + every line under it
+    inventory = []
+    for market in bet365 if isinstance(bet365, list) else []:
+        if not isinstance(market, dict):
+            continue
+        name = market.get("name", "?")
+        odds_list = market.get("odds", [])
+        if not isinstance(odds_list, list):
+            continue
+        entries = []
+        for entry in odds_list:
+            if isinstance(entry, dict):
+                entries.append(entry)
+        inventory.append({"market_name": name, "odds_entries": entries})
+
+    return jsonify({
+        "event": {
+            "id": raw.get("id"),
+            "home": raw.get("home"),
+            "away": raw.get("away"),
+            "league": raw.get("league"),
+            "minute": raw.get("minute"),
+            "score": raw.get("score"),
+        },
+        "markets_inventory": inventory,
+        "total_markets_in_response": len(inventory),
     })
 
 
