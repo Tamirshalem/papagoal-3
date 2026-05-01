@@ -2674,7 +2674,9 @@ def debug_markets():
     # Fetch odds for the first batch
     odds_data = fetch_oddsapi_odds(event_ids_to_try)
 
-    # Find the first event that has actual Bet365 markets with content
+    # Find the first event that has actual Bet365 markets with content.
+    # We don't filter by minute here -- a pre-match event with markets is
+    # just as useful for figuring out the data format.
     chosen = None
     rejected_summary = []
     for raw in odds_data:
@@ -2688,7 +2690,7 @@ def debug_markets():
         minute = raw.get("minute")
         score = raw.get("score")
 
-        if market_count > 0 and minute is not None:
+        if market_count > 0:
             chosen = raw
             break
 
