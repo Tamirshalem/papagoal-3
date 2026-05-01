@@ -124,6 +124,13 @@ RULES_CATALOG = [
     {"num": 103, "name": "Late Game Pressure",     "action": "GOAL",       "desc": "Over below expected by 0.8+ in minute 80+"},
     {"num": 104, "name": "Late Odd Sweet Spot",    "action": "GOAL",       "desc": "Over 2.7-3.5 between minute 85-93"},
     {"num": 200, "name": "High Market Pressure",   "action": "GOAL",       "desc": "Composite pressure score >= 60%"},
+    # ---- Movement-based rules (v6) ----
+    {"num": 300, "name": "Steady Real Drop",       "action": "STRONG_GOAL", "desc": "STEADY_DROP + REAL_DROP + movement_score>=70 -- the gold-standard goal signal"},
+    {"num": 301, "name": "Sharp Real Drop",        "action": "STRONG_GOAL", "desc": "SHARP_DROP + REAL_DROP + movement_score>=60 -- market just learned something"},
+    {"num": 302, "name": "Fake Drop Trap",         "action": "TRAP",        "desc": "Drop followed by reversal -- looks like pressure, isn't"},
+    {"num": 303, "name": "Chaotic Market",         "action": "NO_ENTRY",    "desc": "Mixed up/down movement with no clear direction -- pure noise"},
+    {"num": 304, "name": "Market Rejection",       "action": "NO_GOAL",    "desc": "SPIKE_UP -- odds rising sharply, market rejecting goal"},
+    {"num": 305, "name": "Flat Market Late",       "action": "NO_GOAL",    "desc": "FLAT pattern in minute 55+ -- market doesn't believe"},
 ]
 
 
@@ -169,7 +176,7 @@ def _ensure_column(cur, table: str, column: str, ddl: str):
 
 # Bump this when you make schema changes. On boot, if the DB is on an older
 # version we drop legacy PapaGoal tables and rebuild from scratch.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _read_schema_version() -> int:
@@ -252,31 +259,41 @@ def init_db():
         # ---- odds_snapshots ----
         cur.execute("""
         CREATE TABLE IF NOT EXISTS odds_snapshots (
-            id              BIGSERIAL PRIMARY KEY,
-            match_id        INT REFERENCES matches(id) ON DELETE CASCADE,
-            minute          INT,
-            captured_at     TIMESTAMPTZ DEFAULT NOW(),
-            home_ml         NUMERIC(6,3),
-            draw_ml         NUMERIC(6,3),
-            away_ml         NUMERIC(6,3),
-            over_25         NUMERIC(6,3),
-            under_25        NUMERIC(6,3),
-            over_05_ht      NUMERIC(6,3),
-            over_15_ht      NUMERIC(6,3),
-            prev_over_25    NUMERIC(6,3),
-            opening_over_25 NUMERIC(6,3),
-            direction       TEXT,
-            held_seconds    INT DEFAULT 0,
-            pressure        NUMERIC(6,2),
-            expected_over25 NUMERIC(6,3),
-            is_live         BOOLEAN DEFAULT TRUE,
-            goal_30s        BOOLEAN,
-            goal_60s        BOOLEAN,
-            goal_120s       BOOLEAN,
-            goal_300s       BOOLEAN
+            id                       BIGSERIAL PRIMARY KEY,
+            match_id                 INT REFERENCES matches(id) ON DELETE CASCADE,
+            minute                   INT,
+            captured_at              TIMESTAMPTZ DEFAULT NOW(),
+            home_ml                  NUMERIC(6,3),
+            draw_ml                  NUMERIC(6,3),
+            away_ml                  NUMERIC(6,3),
+            over_25                  NUMERIC(6,3),
+            under_25                 NUMERIC(6,3),
+            over_05_ht               NUMERIC(6,3),
+            over_15_ht               NUMERIC(6,3),
+            prev_over_25             NUMERIC(6,3),
+            opening_over_25          NUMERIC(6,3),
+            direction                TEXT,
+            held_seconds             INT DEFAULT 0,
+            pressure                 NUMERIC(6,2),
+            expected_over25          NUMERIC(6,3),
+            is_live                  BOOLEAN DEFAULT TRUE,
+            goal_30s                 BOOLEAN,
+            goal_60s                 BOOLEAN,
+            goal_120s                BOOLEAN,
+            goal_300s                BOOLEAN,
+            -- Movement engine fields (v6+)
+            movement_pattern         TEXT,
+            drop_type                TEXT,
+            movement_score           INT,
+            total_changes_count      INT,
+            direction_consistency    INT,
+            longest_stable_duration  INT,
+            total_delta              NUMERIC(8,4),
+            avg_time_between_changes INT
         )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_snap_match_time ON odds_snapshots(match_id, captured_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_snap_captured ON odds_snapshots(captured_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_snap_pattern ON odds_snapshots(movement_pattern)")
 
         # ---- goals ----
         cur.execute("""
@@ -714,6 +731,205 @@ def lookup_football(idx: dict, home: str, away: str) -> Optional[dict]:
 
 
 # ============================================================================
+# MOVEMENT ENGINE  --  classifies how the Over 2.5 odd has been moving
+# ============================================================================
+# Adapted from the base44 v1 engine. The idea: a snapshot's value alone is
+# not enough -- the *pattern* of recent movement tells us whether we're
+# looking at real pressure or a market trick.
+#
+#   STEADY_DROP  -> consistent decline = real pressure for a goal
+#   SHARP_DROP   -> sudden big move = market just learned something
+#   FAKE_DROP    -> drop then bounce-back within seconds = trap
+#   SPIKE_UP     -> sharp rise = market is rejecting goal expectation
+#   FLAT         -> no movement at all = market doesn't believe
+#   CHAOTIC      -> mixed up/down with no direction = noise
+#   UNKNOWN      -> too few samples
+#
+# A signal is much stronger when accompanied by REAL_DROP than when it's just
+# "Over 2.5 is at 1.85 in minute 30".
+
+MOVEMENT_BUFFER_SECONDS = 180  # look at the last 3 minutes of snapshots
+
+
+def _build_movement_buffer(snaps: list) -> list:
+    """snaps is a list of (captured_at_dt, over_25_float) tuples, OLDEST first.
+    Returns a list of dicts with delta vs previous, direction, time_since_prev."""
+    out = []
+    for i, (ts, odd) in enumerate(snaps):
+        if odd is None:
+            continue
+        if i == 0:
+            out.append({"ts": ts, "odd": odd, "delta": 0.0,
+                        "direction": "stable", "time_since_prev": 0})
+        else:
+            prev_ts, prev_odd = snaps[i - 1]
+            if prev_odd is None:
+                out.append({"ts": ts, "odd": odd, "delta": 0.0,
+                            "direction": "stable", "time_since_prev": 0})
+                continue
+            delta = float(odd) - float(prev_odd)
+            time_since = (ts - prev_ts).total_seconds()
+            direction = "down" if delta < -0.005 else "up" if delta > 0.005 else "stable"
+            out.append({"ts": ts, "odd": float(odd), "delta": round(delta, 4),
+                        "direction": direction, "time_since_prev": time_since})
+    return out
+
+
+def _compute_movement_metrics(buf: list) -> dict:
+    """Aggregate stats from the movement buffer."""
+    if len(buf) < 2:
+        return {"total_changes_count": 0, "avg_time_between_changes": 0,
+                "total_delta": 0.0, "direction_consistency": 0,
+                "longest_stable_duration": 0, "movement_score": 0}
+
+    changes = [b for b in buf if b["delta"] != 0]
+    total_changes = len(changes)
+    intervals = [b["time_since_prev"] for b in changes if b["time_since_prev"] > 0]
+    avg_interval = sum(intervals) / len(intervals) if intervals else 0
+    total_delta = buf[-1]["odd"] - buf[0]["odd"]
+    downs = len([b for b in changes if b["delta"] < 0])
+    ups = len([b for b in changes if b["delta"] > 0])
+    dominant = max(downs, ups)
+    direction_consistency = round((dominant / total_changes) * 100) if total_changes > 0 else 0
+
+    # Longest stable run
+    longest_stable = 0
+    current_stable = 0
+    for b in buf:
+        if b["delta"] == 0:
+            current_stable += b["time_since_prev"]
+            longest_stable = max(longest_stable, current_stable)
+        else:
+            current_stable = 0
+
+    # Composite movement score 0-100
+    consistency_score = direction_consistency * 0.40
+    duration_score = min(1, total_changes / 12) * 100 * 0.30
+    flip_penalty = abs(ups - downs) / total_changes if total_changes > 0 else 0
+    smoothness_score = (1 - min(1, flip_penalty)) * 100 * 0.20
+    magnitude_score = min(1, abs(total_delta) / 0.5) * 100 * 0.10
+    movement_score = round(max(0, min(100,
+        consistency_score + duration_score + smoothness_score + magnitude_score)))
+
+    return {
+        "total_changes_count": total_changes,
+        "avg_time_between_changes": round(avg_interval),
+        "total_delta": round(total_delta, 4),
+        "direction_consistency": direction_consistency,
+        "longest_stable_duration": round(longest_stable),
+        "movement_score": movement_score,
+    }
+
+
+def _classify_movement_pattern(buf: list, metrics: dict) -> str:
+    """Pick one of: STEADY_DROP, SHARP_DROP, FAKE_DROP, SPIKE_UP, FLAT, CHAOTIC, UNKNOWN."""
+    if not buf or len(buf) < 2:
+        return "UNKNOWN"
+
+    tcc = metrics["total_changes_count"]
+    dc = metrics["direction_consistency"]
+    td = metrics["total_delta"]
+    lsd = metrics["longest_stable_duration"]
+    atbc = metrics["avg_time_between_changes"]
+
+    # FLAT: held same value
+    if lsd >= 60 and tcc <= 1:
+        return "FLAT"
+    if abs(td) < 0.02 and tcc < 3:
+        return "FLAT"
+
+    # SPIKE_UP: rising fast
+    if td > 0.05 and dc >= 60:
+        return "SPIKE_UP"
+
+    # Various drop types
+    if td < -0.02:
+        # Look at the last 3 changes for a trailing reversal
+        last_changes = [b for b in buf if b["delta"] != 0][-3:]
+        last_dir = last_changes[-1]["direction"] if last_changes else None
+        prev_dir = last_changes[-2]["direction"] if len(last_changes) >= 2 else None
+        last_int = last_changes[-1]["time_since_prev"] if last_changes else 999
+
+        # Recent up-bounce after down = FAKE_DROP
+        if last_dir == "up" and prev_dir == "down" and last_int <= 60:
+            return "FAKE_DROP"
+        # Few big steps = SHARP_DROP
+        if tcc <= 4 and abs(td) >= 0.15:
+            return "SHARP_DROP"
+        if atbc < 15 and abs(td) >= 0.10:
+            return "SHARP_DROP"
+        # Many consistent steps = STEADY_DROP
+        if dc >= 65 and tcc >= 3:
+            return "STEADY_DROP"
+
+    # No clear direction = CHAOTIC
+    if dc < 50 and tcc >= 3:
+        return "CHAOTIC"
+
+    return "UNKNOWN"
+
+
+def _classify_drop_type(buf: list, metrics: dict, pattern: str) -> str:
+    """REAL_DROP / FAKE_DROP / NONE.
+
+    A REAL_DROP is the gold standard: a drop that has been confirmed by
+    sustained downward movement with no recent upward ticks. This is what
+    the base44 system found to drive most successful signals."""
+    if pattern in ("FAKE_DROP", "CHAOTIC"):
+        return "FAKE_DROP"
+    if pattern not in ("STEADY_DROP", "SHARP_DROP"):
+        return "NONE"
+
+    # Has there been any upward tick in the last 60s?
+    if buf:
+        latest_ts = buf[-1]["ts"]
+        recent_60 = [b for b in buf
+                     if (latest_ts - b["ts"]).total_seconds() <= 60]
+        if any(b["delta"] > 0 for b in recent_60):
+            return "FAKE_DROP"
+
+    if (metrics["total_changes_count"] >= 3
+            and metrics["avg_time_between_changes"] >= 10
+            and metrics["direction_consistency"] >= 70):
+        return "REAL_DROP"
+
+    return "FAKE_DROP"
+
+
+def fetch_movement_buffer(cur, match_id: int) -> list:
+    """Pull the snapshots for a match in the last MOVEMENT_BUFFER_SECONDS."""
+    cur.execute("""
+        SELECT captured_at, over_25
+          FROM odds_snapshots
+         WHERE match_id = %s
+           AND captured_at >= NOW() - (%s || ' seconds')::interval
+         ORDER BY captured_at ASC
+    """, (match_id, MOVEMENT_BUFFER_SECONDS))
+    rows = cur.fetchall()
+    return [(r[0], float(r[1]) if r[1] is not None else None) for r in rows]
+
+
+def analyze_movement(cur, match_id: int) -> dict:
+    """High-level entry point. Returns dict with movement_pattern, drop_type,
+    movement_score, total_changes, direction_consistency, etc."""
+    snaps = fetch_movement_buffer(cur, match_id)
+    buf = _build_movement_buffer(snaps)
+    metrics = _compute_movement_metrics(buf)
+    pattern = _classify_movement_pattern(buf, metrics)
+    drop_type = _classify_drop_type(buf, metrics, pattern)
+    return {
+        "movement_pattern": pattern,
+        "drop_type": drop_type,
+        "movement_score": metrics["movement_score"],
+        "total_changes_count": metrics["total_changes_count"],
+        "direction_consistency": metrics["direction_consistency"],
+        "longest_stable_duration": metrics["longest_stable_duration"],
+        "total_delta": metrics["total_delta"],
+        "avg_time_between_changes": metrics["avg_time_between_changes"],
+    }
+
+
+# ============================================================================
 # RULES ENGINE
 # ============================================================================
 def evaluate_rules(snap: dict, prev: Optional[dict], opening: Optional[dict]) -> list:
@@ -833,6 +1049,46 @@ def evaluate_rules(snap: dict, prev: Optional[dict], opening: Optional[dict]) ->
         add(200, "High Market Pressure", "GOAL", min(95, 50 + snap["pressure"] / 2),
             {"pressure": snap["pressure"]})
 
+    # ===== Movement-based rules (v6 / port from base44) =====
+    # These look at the *pattern* of recent movement, not just the current odd.
+    # The drop_type "REAL_DROP" means the market has been pushing the odd
+    # downward consistently with no recent reversals -- the strongest
+    # confirmation that a goal is coming.
+    pat   = snap.get("movement_pattern")
+    dt    = snap.get("drop_type")
+    mscore = snap.get("movement_score") or 0
+    dconst = snap.get("direction_consistency") or 0
+
+    # --- Rule 300: STEADY_DROP confirmed (the gold-standard goal signal) ---
+    if pat == "STEADY_DROP" and dt == "REAL_DROP" and mscore >= 70:
+        add(300, "Steady Real Drop", "STRONG_GOAL", min(95, 70 + (mscore - 70) / 2),
+            {"movement_score": mscore, "consistency": dconst})
+
+    # --- Rule 301: SHARP_DROP confirmed -- market just learned something ---
+    if pat == "SHARP_DROP" and dt == "REAL_DROP" and mscore >= 60:
+        add(301, "Sharp Real Drop", "STRONG_GOAL", min(95, 65 + (mscore - 60) / 3),
+            {"movement_score": mscore, "consistency": dconst})
+
+    # --- Rule 302: FAKE_DROP trap -- looks like pressure, isn't ---
+    if pat == "FAKE_DROP" or dt == "FAKE_DROP":
+        add(302, "Fake Drop Trap", "TRAP", 75,
+            {"movement_score": mscore})
+
+    # --- Rule 303: CHAOTIC market -- noise, no information ---
+    if pat == "CHAOTIC":
+        add(303, "Chaotic Market", "NO_ENTRY", 60,
+            {"consistency": dconst})
+
+    # --- Rule 304: SPIKE_UP -- market is rejecting goal expectation ---
+    if pat == "SPIKE_UP":
+        add(304, "Market Rejection", "NO_GOAL", 70,
+            {"movement_score": mscore})
+
+    # --- Rule 305: FLAT in mid-late game -- market doesn't believe ---
+    if pat == "FLAT" and minute and minute >= 55:
+        add(305, "Flat Market Late", "NO_GOAL", 65,
+            {"longest_stable": snap.get("longest_stable_duration", 0)})
+
     return signals
 
 
@@ -900,7 +1156,12 @@ def upsert_match(cur, parsed: dict, fb_data: Optional[dict]) -> Optional[int]:
 
 def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
                   opening_over: Optional[float], minute: Optional[int]) -> dict:
-    """Insert one snapshot row, returning the snap dict (for rule eval)."""
+    """Insert one snapshot row, returning the snap dict (for rule eval).
+
+    The movement analysis runs on the *previous* snapshots that already exist
+    in the table (since this new row hasn't been inserted yet). We then store
+    the resulting pattern/drop_type alongside this new row -- so each snapshot
+    is tagged with the movement pattern that was active going into it."""
     over = parsed.get("over_25")
     prev_over = prev_snap.get("over_25") if prev_snap else None
     direction = _direction(prev_over, over)
@@ -913,12 +1174,19 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
     expected = get_expected_odd(EXPECTED_OVER25, minute) if minute is not None else None
     pressure = calculate_pressure(over, expected)
 
+    # ---- Movement analysis on existing snapshots (before this one is saved) ----
+    movement = analyze_movement(cur, match_id)
+
     cur.execute("""
         INSERT INTO odds_snapshots
             (match_id, minute, home_ml, draw_ml, away_ml, over_25, under_25,
              over_05_ht, over_15_ht, prev_over_25, opening_over_25,
-             direction, held_seconds, pressure, expected_over25, is_live)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+             direction, held_seconds, pressure, expected_over25, is_live,
+             movement_pattern, drop_type, movement_score, total_changes_count,
+             direction_consistency, longest_stable_duration, total_delta,
+             avg_time_between_changes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,
+                %s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         match_id, minute,
         parsed.get("home_ml"), parsed.get("draw_ml"), parsed.get("away_ml"),
@@ -927,6 +1195,10 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
         prev_over, opening_over,
         direction, held, round(pressure, 2),
         round(expected, 3) if expected else None,
+        movement["movement_pattern"], movement["drop_type"],
+        movement["movement_score"], movement["total_changes_count"],
+        movement["direction_consistency"], movement["longest_stable_duration"],
+        movement["total_delta"], movement["avg_time_between_changes"],
     ))
 
     return {
@@ -940,6 +1212,11 @@ def save_snapshot(cur, match_id: int, parsed: dict, prev_snap: Optional[dict],
         "direction": direction,
         "held_seconds": held,
         "pressure": round(pressure, 2),
+        # Movement engine output exposed to rules
+        "movement_pattern": movement["movement_pattern"],
+        "drop_type": movement["drop_type"],
+        "movement_score": movement["movement_score"],
+        "direction_consistency": movement["direction_consistency"],
     }
 
 
@@ -1720,12 +1997,15 @@ tr:hover td{background:var(--card2)}
 .tag{display:inline-block;padding:3px 8px;border-radius:4px;font-size:10px;
   font-weight:700;letter-spacing:.05em;text-transform:uppercase}
 .tag.GOAL{background:rgba(0,255,157,.12);color:var(--goal)}
+.tag.STRONG_GOAL{background:var(--goal);color:#000;box-shadow:0 0 12px rgba(0,255,157,.4)}
+.tag.WEAK_GOAL{background:rgba(0,255,157,.18);color:var(--goal);border:1px dashed var(--goal)}
 .tag.NO_GOAL{background:rgba(255,56,96,.15);color:var(--trap)}
 .tag.TRAP{background:rgba(255,56,96,.15);color:var(--trap)}
 .tag.DRAW_UNDER{background:rgba(168,136,255,.18);color:var(--noentry)}
 .tag.NO_ENTRY{background:rgba(125,138,156,.18);color:var(--mute)}
 .tag.HOT{background:var(--hot);color:#fff}
 .tag.LIVE{background:var(--goal);color:#000}
+.tag.PATTERN{background:rgba(78,161,255,.15);color:var(--info);font-size:9px}
 .bar{height:8px;background:var(--card2);border-radius:4px;overflow:hidden;
   margin-top:6px;border:1px solid var(--line)}
 .bar>span{display:block;height:100%;background:linear-gradient(90deg,var(--info),var(--accent),var(--hot));
@@ -1814,7 +2094,8 @@ def page_live():
                        m.score_home, m.score_away, m.opening_over25,
                        s.over_25, s.draw_ml, s.over_05_ht, s.over_15_ht,
                        s.direction, s.held_seconds, s.pressure,
-                       s.expected_over25, s.captured_at
+                       s.expected_over25, s.captured_at,
+                       s.movement_pattern, s.drop_type, s.movement_score
                   FROM matches m
              LEFT JOIN LATERAL (
                        SELECT *
@@ -1869,6 +2150,27 @@ def page_live():
             score = f"{r['score_home']}-{r['score_away']}"
             dir_html = f'<span class="{_direction_class(r["direction"])}">{_direction_arrow(r["direction"])} {r["direction"] or "-"}</span>'
             held = r['held_seconds'] or 0
+
+            # Movement column
+            mp = r.get('movement_pattern') or 'UNKNOWN'
+            dt = r.get('drop_type') or 'NONE'
+            ms = r.get('movement_score') or 0
+            # Color the pattern by goodness
+            pattern_color = {
+                'STEADY_DROP': 'down',  # green
+                'SHARP_DROP':  'down',
+                'FAKE_DROP':   'up',    # red
+                'SPIKE_UP':    'up',
+                'CHAOTIC':     'up',
+                'FLAT':        'muted',
+                'UNKNOWN':     'dim',
+            }.get(mp, 'muted')
+            # Bold REAL_DROP since it's the gold-standard signal
+            dt_html = f'<b style="color:var(--goal)">{dt}</b>' if dt == 'REAL_DROP' else \
+                      f'<span class="muted">{dt}</span>'
+            movement_html = (f'<span class="tag PATTERN {pattern_color}">{mp.replace("_", " ")}</span>'
+                             f'<br>{dt_html} <span class="muted">· {ms}</span>')
+
             match_rows.append(f"""
             <tr>
               <td><span class="live-dot"></span><b>{r['home']}</b><br><b>{r['away']}</b></td>
@@ -1880,6 +2182,7 @@ def page_live():
               <td class="right">{r['over_05_ht'] or '-'}</td>
               <td class="right">{r['over_15_ht'] or '-'}</td>
               <td>{dir_html}<br><span class="muted">held {held}s</span></td>
+              <td style="min-width:130px">{movement_html}</td>
               <td style="min-width:140px">
                 <b class="{'up' if press>60 else ('down' if press>30 else 'muted')}">{round(press,1)}%</b>
                 <div class="bar"><span style="width:{press_pct}%"></span></div>
@@ -1887,7 +2190,7 @@ def page_live():
             </tr>""")
         match_html = "".join(match_rows)
     else:
-        match_html = '<tr><td colspan="10" class="empty">Scanner is warming up… (waiting for first live odds)</td></tr>'
+        match_html = '<tr><td colspan="11" class="empty">Scanner is warming up… (waiting for first live odds)</td></tr>'
 
     body = f"""
     <div class="statline">
@@ -1917,7 +2220,7 @@ def page_live():
             <th class="right">Over 2.5</th><th class="right">Open</th>
             <th class="right">Draw</th><th class="right">Over 0.5 HT</th>
             <th class="right">Over 1.5 HT</th>
-            <th>Direction</th><th>Pressure</th></tr>
+            <th>Direction</th><th>Movement</th><th>Pressure</th></tr>
         {match_html}
       </table>
     </div>
