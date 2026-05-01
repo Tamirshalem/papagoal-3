@@ -2651,7 +2651,7 @@ def health():
 
 @app.route("/debug/markets")
 def debug_markets():
-    """Show raw OddsAPI response for the first live event we can find.
+    """Show raw OddsAPI response for the first live event with actual markets.
     Useful for figuring out what markets and lines OddsAPI actually ships."""
     if not ODDSPAPI_KEY:
         return jsonify({"error": "ODDSPAPI_KEY not set"}), 500
@@ -2660,20 +2660,56 @@ def debug_markets():
     if not events:
         return jsonify({"error": "no live events right now"}), 200
 
-    # Pick first event with a Bet365 quote
-    first_id = events[0].get("id") or events[0].get("eventId")
-    if not first_id:
-        return jsonify({"error": "no event id", "raw_events_sample": events[:1]}), 200
+    # Try to find a match with non-empty bookmaker data. We try up to 10
+    # events because the first ones are often pre-match with no quotes yet.
+    event_ids_to_try = []
+    for ev in events[:30]:
+        eid = ev.get("id") or ev.get("eventId")
+        if eid:
+            event_ids_to_try.append(str(eid))
 
-    odds_data = fetch_oddsapi_odds([str(first_id)])
-    if not odds_data:
-        return jsonify({"error": "no odds returned", "event_id": first_id}), 200
+    if not event_ids_to_try:
+        return jsonify({"error": "no event ids found"}), 200
 
-    raw = odds_data[0]
-    bookmakers = raw.get("bookmakers") or {}
+    # Fetch odds for the first batch
+    odds_data = fetch_oddsapi_odds(event_ids_to_try)
+
+    # Find the first event that has actual Bet365 markets with content
+    chosen = None
+    rejected_summary = []
+    for raw in odds_data:
+        bookmakers = raw.get("bookmakers") or {}
+        bet365 = bookmakers.get("Bet365") or bookmakers.get("bet365") or []
+        market_count = len(bet365) if isinstance(bet365, list) else 0
+
+        eid = raw.get("id") or raw.get("eventId")
+        home = raw.get("home", "?")
+        away = raw.get("away", "?")
+        minute = raw.get("minute")
+        score = raw.get("score")
+
+        if market_count > 0 and minute is not None:
+            chosen = raw
+            break
+
+        rejected_summary.append({
+            "id": eid,
+            "match": f"{home} vs {away}",
+            "minute": minute,
+            "score": score,
+            "market_count": market_count,
+        })
+
+    if not chosen:
+        return jsonify({
+            "error": "couldn't find a live event with markets",
+            "tried_count": len(odds_data),
+            "rejected_examples": rejected_summary[:10],
+        }), 200
+
+    # Build a clean inventory of every market name + every line
+    bookmakers = chosen.get("bookmakers") or {}
     bet365 = bookmakers.get("Bet365") or bookmakers.get("bet365") or []
-
-    # Build a clean inventory of every market name + every line under it
     inventory = []
     for market in bet365 if isinstance(bet365, list) else []:
         if not isinstance(market, dict):
@@ -2688,17 +2724,21 @@ def debug_markets():
                 entries.append(entry)
         inventory.append({"market_name": name, "odds_entries": entries})
 
+    league_raw = chosen.get("league")
+    league_name = league_raw.get("name") if isinstance(league_raw, dict) else league_raw
+
     return jsonify({
         "event": {
-            "id": raw.get("id"),
-            "home": raw.get("home"),
-            "away": raw.get("away"),
-            "league": raw.get("league"),
-            "minute": raw.get("minute"),
-            "score": raw.get("score"),
+            "id": chosen.get("id"),
+            "home": chosen.get("home"),
+            "away": chosen.get("away"),
+            "league": league_name,
+            "minute": chosen.get("minute"),
+            "score": chosen.get("score"),
         },
         "markets_inventory": inventory,
         "total_markets_in_response": len(inventory),
+        "events_skipped_before_finding_one": len(rejected_summary),
     })
 
 
