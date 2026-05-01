@@ -498,9 +498,24 @@ def parse_match_odds(item: dict) -> Optional[dict]:
     if not isinstance(item, dict):
         return None
 
+    def _as_str(v) -> str:
+        """Coerce anything to a clean string. OddsAPI sometimes ships
+        league/team/competition as a dict like {'name': 'Premier League', 'id': 1}
+        instead of a plain string."""
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            for k in ("name", "title", "shortName", "fullName"):
+                if v.get(k):
+                    return str(v[k])
+            return ""
+        return str(v)
+
     event_id = item.get("id") or item.get("eventId")
-    home = item.get("home") or item.get("homeTeam")
-    away = item.get("away") or item.get("awayTeam")
+    home = _as_str(item.get("home") or item.get("homeTeam"))
+    away = _as_str(item.get("away") or item.get("awayTeam"))
     if not event_id or not home or not away:
         return None
 
@@ -508,9 +523,9 @@ def parse_match_odds(item: dict) -> Optional[dict]:
         "event_id": str(event_id),
         "home": home,
         "away": away,
-        "league": item.get("league") or item.get("competition") or "",
+        "league": _as_str(item.get("league") or item.get("competition") or ""),
         "minute": item.get("minute") if isinstance(item.get("minute"), int) else None,
-        "score": item.get("score") or "",
+        "score": _as_str(item.get("score") or ""),
         "home_ml": None, "draw_ml": None, "away_ml": None,
         "over_25": None, "under_25": None,
         "over_05_ht": None, "over_15_ht": None,
@@ -1151,7 +1166,11 @@ def scan_once():
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT row_sp")
                 SCANNER_STATS["errors"] += 1
-                log.warning(f"row failed: {e}")
+                # Include event_id + home/away so we can pinpoint problem rows
+                eid = (parsed or {}).get("event_id", "?") if 'parsed' in dir() else "?"
+                hm = (parsed or {}).get("home", "?") if 'parsed' in dir() else "?"
+                aw = (parsed or {}).get("away", "?") if 'parsed' in dir() else "?"
+                log.warning(f"row failed [{eid} {hm} vs {aw}]: {e}")
 
         try:
             settle_paper_trades(cur)
