@@ -167,13 +167,70 @@ def _ensure_column(cur, table: str, column: str, ddl: str):
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+# Bump this when you make schema changes. On boot, if the DB is on an older
+# version we drop legacy PapaGoal tables and rebuild from scratch.
+SCHEMA_VERSION = 5
+
+
+def _read_schema_version() -> int:
+    """Read the persisted schema version. Uses its own connection so a
+    failure here doesn't poison subsequent migrations."""
+    if not DATABASE_URL:
+        return 0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'schema_version')
+                """)
+                if not cur.fetchone()[0]:
+                    return 0
+                cur.execute("SELECT version FROM schema_version LIMIT 1")
+                row = cur.fetchone()
+                return row[0] if row else 0
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"_read_schema_version failed (treating as 0): {e}")
+        return 0
+
+
+def _drop_legacy_tables():
+    """Drop all PapaGoal tables. Each DROP runs in its own transaction so
+    one failure can't poison the whole batch."""
+    tables = ("paper_trades", "signals", "goals", "odds_snapshots",
+              "ai_insights", "rules", "matches", "schema_version")
+    for t in tables:
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+                conn.commit()
+                log.info(f"  dropped {t}")
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning(f"  drop {t} failed: {e}")
+
+
 def init_db():
     """Idempotent schema setup -- runs every boot, safe to re-run."""
     if not DATABASE_URL:
         log.warning("DATABASE_URL missing -- skipping init_db")
         return
 
-    log.info("init_db: creating tables / running migrations...")
+    current_version = _read_schema_version()
+    log.info(f"init_db: current schema version = {current_version}, target = {SCHEMA_VERSION}")
+
+    if current_version < SCHEMA_VERSION:
+        log.warning(f"Upgrading schema {current_version} -> {SCHEMA_VERSION}: "
+                    f"dropping legacy PapaGoal tables")
+        _drop_legacy_tables()
+
     with db_cursor() as cur:
         # ---- matches ----
         cur.execute("""
@@ -325,7 +382,17 @@ def init_db():
             goals_analyzed  INT DEFAULT 0
         )""")
 
-    log.info("init_db: done")
+        # ---- schema_version (track current version so we don't re-drop on every boot) ----
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version    INT PRIMARY KEY,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""")
+        cur.execute("DELETE FROM schema_version")
+        cur.execute("INSERT INTO schema_version (version) VALUES (%s)",
+                    (SCHEMA_VERSION,))
+
+    log.info(f"init_db: done (schema v{SCHEMA_VERSION})")
 
 
 # ============================================================================
@@ -463,8 +530,10 @@ def parse_match_odds(item: dict) -> Optional[dict]:
         if not isinstance(odds_list, list) or not odds_list:
             continue
 
-        # ----- 1X2 / Match Result -----
-        if market_name.upper() in ("ML", "1X2", "MATCH WINNER", "MATCH RESULT"):
+        mn_upper = market_name.upper()
+
+        # ----- Full-time 1X2 -----
+        if mn_upper in ("ML", "1X2", "MATCH WINNER", "MATCH RESULT"):
             _log_market_once(market_name, True)
             first = odds_list[0]
             if isinstance(first, dict):
@@ -472,11 +541,18 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 out["draw_ml"] = _to_float(first.get("draw"))
                 out["away_ml"] = _to_float(first.get("away"))
 
+        # ----- Half-time 1X2 (captured for completeness, not currently used) -----
+        elif mn_upper in ("ML HT", "1X2 HT", "1ST HALF ML",
+                          "FIRST HALF ML", "MATCH WINNER HT"):
+            _log_market_once(market_name, True)
+            # not currently consumed by any rule -- placeholder
+
         # ----- Full-time Over/Under -----
-        # Note: FT 0.5 / FT 1.5 lines are *not* the same as HT 0.5 / HT 1.5.
-        # We capture FT 2.5 (and 3.5 for context). HT lines are populated only
-        # from the HT market block below.
-        elif market_name in ("Over/Under", "Total Goals", "Goals Over/Under"):
+        # OddsAPI calls this "Totals". Other providers call it "Over/Under".
+        # FT 0.5 / FT 1.5 lines are *not* the same as HT 0.5 / HT 1.5 -- HT
+        # comes from the dedicated half-time market below.
+        elif mn_upper in ("TOTALS", "OVER/UNDER", "TOTAL GOALS",
+                          "GOALS OVER/UNDER", "MATCH TOTALS"):
             _log_market_once(market_name, True)
             for entry in odds_list:
                 if not isinstance(entry, dict):
@@ -493,8 +569,13 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 elif abs(line - 3.5) < 0.01:
                     out["over_35"] = ov
 
-        # ----- 1st-half Over/Under -----
-        elif any(k in market_name.lower() for k in ("1st half", "first half", "half time", "ht ", " ht", "1h ", " 1h")):
+        # ----- Half-time Over/Under -----
+        # OddsAPI ships this as "Totals HT". We want max=0.5 and max=1.5.
+        elif mn_upper in ("TOTALS HT", "OVER/UNDER HT",
+                          "1ST HALF OVER/UNDER", "FIRST HALF OVER/UNDER",
+                          "HALF TIME OVER/UNDER", "1ST HALF GOALS",
+                          "FIRST HALF GOALS", "1ST HALF TOTALS",
+                          "HT TOTALS", "HALFTIME TOTALS"):
             _log_market_once(market_name, True)
             for entry in odds_list:
                 if not isinstance(entry, dict):
@@ -1022,9 +1103,13 @@ def scan_once():
 
     with db_cursor() as cur:
         for row in merged:
+            # Each row gets its own savepoint -- one row failing won't
+            # cascade-abort the rest of the batch.
+            cur.execute("SAVEPOINT row_sp")
             try:
                 parsed = parse_match_odds(row)
                 if not parsed:
+                    cur.execute("RELEASE SAVEPOINT row_sp")
                     continue
 
                 fb = lookup_football(fb_idx, parsed["home"], parsed["away"])
@@ -1061,9 +1146,12 @@ def scan_once():
                     fire_signals(cur, match_id, snap, parsed, fb["minute"],
                                  opening, signals)
 
+                cur.execute("RELEASE SAVEPOINT row_sp")
+
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT row_sp")
                 SCANNER_STATS["errors"] += 1
-                log.warning(f"row failed: {e}\n{traceback.format_exc()}")
+                log.warning(f"row failed: {e}")
 
         try:
             settle_paper_trades(cur)
