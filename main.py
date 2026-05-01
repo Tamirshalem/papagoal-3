@@ -1240,14 +1240,129 @@ def scanner_loop():
 # ============================================================================
 # CLAUDE AI
 # ============================================================================
+
+# This is the master system prompt. It defines who Claude is, what PapaGoal's
+# philosophy is, and how Claude must reason about football odds patterns.
+# It is sent with EVERY call to Claude in this app.
+PAPAGOAL_SYSTEM_PROMPT = """You are PapaGoal AI.
+
+Your main job is to discover football goal/no-goal patterns based on the relationship between:
+- match minute
+- score
+- Over/Under odds
+- odds movement over time
+- opening odds vs current odds
+- expected odds for that minute
+- goals that happened or did not happen afterward
+
+Core idea:
+PapaGoal does not analyze football teams.
+PapaGoal analyzes whether the odds are too low or too high for the current minute.
+
+The most important concept is:
+
+Expected Odds vs Real Odds
+
+Example:
+If minute is 88 and the odds for another goal are 2.80-3.30,
+this may be low for that minute.
+Normally late-minute goal odds should be much higher.
+If odds are still relatively low, the market may still believe a goal is coming.
+
+Another example:
+Opening:
+Over 0.5 first half = 1.25
+Over 1.5 first half = 2.10
+
+Minute 25, score 0-0:
+Over 0.5 first half is now 1.70-1.80
+
+This may indicate accumulated pressure:
+The market expected an early goal, no goal has happened yet, but the odds are still not high enough for the time remaining.
+This can suggest a first-half goal is still likely.
+
+Your job is to find these types of patterns from data.
+
+Analyze:
+- odds snapshots
+- goals detected
+- paper trades
+- failed signals
+- successful signals
+- pattern_stats
+
+Look for patterns such as:
+
+1. Odds too low for the minute
+   Minute 80-90 with Over/Next Goal odds 2.70-3.50.
+   Did a goal happen within 2/5/10 minutes?
+
+2. First-half accumulated pressure
+   Opening Over 0.5 HT very low, like 1.20-1.35.
+   By minute 20-30, current Over 0.5 HT rises to 1.60-1.90.
+   Did a first-half goal happen before HT?
+
+3. Over 1.5 HT pressure
+   Opening Over 1.5 HT around 2.00-2.30.
+   Minute 20-30 with 0 or 1 goals.
+   Current odds still indicate the market expects another goal.
+   Did another goal happen before HT?
+
+4. Market rejection / no-goal patterns
+   Odds jump too high too fast. Over odds rise sharply.
+   Market stops believing in a goal.
+   Did a goal NOT happen within 5/10 minutes?
+
+5. Trap patterns
+   Odds look attractive but goal does not happen.
+   Find what was different: minute too late, pressure too low, odds movement too fast,
+   reversal, score state, market frozen.
+
+For every pattern, compare:
+- minute range
+- score state
+- market name
+- opening odds
+- current odds
+- expected odds at that minute
+- difference between expected and current odds
+- pressure score
+- held seconds
+- movement direction
+- goals within 2 / 5 / 10 minutes
+- no goal cases
+- false positives
+- paper trade result
+
+Your output must focus on learning rules like:
+"When current odds are lower than expected for this minute by X%, and this happens
+ between minutes Y-Z, goals occurred within 5/10 minutes in N% of similar cases."
+
+DO NOT make betting instructions.
+DO NOT use the words: bet, enter, stake, guaranteed, sure goal.
+
+Only produce: patterns discovered, rules to test, rules to narrow,
+no-goal patterns, trap patterns, missing data warnings.
+
+If there is not enough data, say: "Not enough data yet to confirm this pattern."
+
+Important:
+- Focus mainly on Over/Under goal odds compared to the minute.
+- Learn from both goals and no-goal cases.
+- New rules are hypotheses only.
+- Do not invent statistics if sample size is too small.
+- Reply in Hebrew inside all JSON text fields."""
+
+
 def claude_call(prompt: str, system: str = "", max_tokens: int = 1500) -> str:
+    """Generic Claude wrapper. Defaults to PapaGoal's master system prompt."""
     if not _anthropic_client:
         return ""
     try:
         msg = _anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=max_tokens,
-            system=system or "You are a sharp football betting markets analyst.",
+            system=system or PAPAGOAL_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
         return msg.content[0].text if msg.content else ""
@@ -1257,56 +1372,297 @@ def claude_call(prompt: str, system: str = "", max_tokens: int = 1500) -> str:
 
 
 def claude_review_signal(signal_row: dict) -> str:
+    """One-off review of a single live signal. Outputs short Hebrew prose
+    consistent with PapaGoal's philosophy (no betting language)."""
     if not _anthropic_client:
         return ""
-    prompt = f"""Hot signal triggered. In 2-3 short Hebrew sentences, tell me if you'd bet it:
 
-Match: {signal_row.get('home')} vs {signal_row.get('away')}  (minute {signal_row.get('minute')})
-Rule: {signal_row.get('rule_name')} -> {signal_row.get('verdict')}  (confidence {signal_row.get('confidence')}%)
-Live Over 2.5: {signal_row.get('over_odd')}
-Over 0.5 HT: {signal_row.get('over_05_ht_odd')}
-Over 1.5 HT: {signal_row.get('over_15_ht_odd')}
-Pressure score: {signal_row.get('pressure_score')}
-Opening Over 2.5: {signal_row.get('opening_over')}
+    # Compute the gap vs the expected curve so Claude can reason about it
+    minute = signal_row.get("minute") or 0
+    over   = signal_row.get("over_odd")
+    o05    = signal_row.get("over_05_ht_odd")
+    o15    = signal_row.get("over_15_ht_odd")
+    exp_25  = get_expected_odd(EXPECTED_OVER25, minute)
+    exp_05  = get_expected_odd(EXPECTED_OVER05_HT, minute) if minute <= 45 else None
+    exp_15  = get_expected_odd(EXPECTED_OVER15_HT, minute) if minute <= 45 else None
 
-Be blunt. Say YES / NO / MAYBE first, then 1 reason."""
-    return claude_call(prompt, max_tokens=300)
+    def _gap(actual, expected):
+        if not actual or not expected:
+            return "n/a"
+        return f"{round((float(expected) - float(actual)) / float(expected) * 100, 1)}%"
+
+    prompt = f"""A live signal just fired. Analyze it through the PapaGoal lens
+(expected odds vs real odds for this minute). Reply in 3-5 short Hebrew sentences.
+
+MATCH: {signal_row.get('home')} vs {signal_row.get('away')}
+MINUTE: {minute}
+RULE: {signal_row.get('rule_name')} -> {signal_row.get('verdict')}
+PRESSURE SCORE: {signal_row.get('pressure_score')}
+RULE CONFIDENCE: {signal_row.get('confidence')}%
+
+ODDS SNAPSHOT:
+- Live Over 2.5:    {over}    (expected at this minute: {exp_25}, gap: {_gap(over, exp_25)})
+- Over 0.5 HT:      {o05}     (expected: {exp_05}, gap: {_gap(o05, exp_05)})
+- Over 1.5 HT:      {o15}     (expected: {exp_15}, gap: {_gap(o15, exp_15)})
+- Opening Over 2.5: {signal_row.get('opening_over')}
+- Opening Draw:     {signal_row.get('opening_draw')}
+
+YOUR TASK:
+Tell me, in Hebrew, what the market is saying here. Specifically:
+1. Does the gap between expected and real odds support the rule's verdict?
+2. Is the minute-range appropriate for this kind of signal?
+3. What's the main risk factor that could make this a trap?
+4. Confidence assessment: low / medium / high (and why).
+
+Do NOT use the words: bet, stake, guaranteed, sure goal, "go for it".
+Talk in terms of "the market is signaling X" / "the pattern suggests Y" / "trap risk: Z"."""
+
+    return claude_call(prompt, max_tokens=600)
+
+
+def _gather_pattern_data() -> dict:
+    """Pull a comprehensive analysis snapshot from the DB for Claude to learn from.
+
+    Returns dict with: goals (last 7 days), failed_signals, successful_signals,
+    paper_trade_summary, no_goal_examples (snapshots that LOOKED like signals
+    but didn't lead to goals)."""
+    out = {
+        "goals": [],
+        "successful_signals": [],
+        "failed_signals": [],
+        "paper_trade_summary": {},
+        "no_goal_examples": [],
+        "rule_performance": [],
+    }
+    try:
+        with db_cursor(dict_rows=True) as cur:
+            # Goals + the odds snapshots that preceded them
+            cur.execute("""
+                SELECT g.minute, g.score_before, g.score_after, g.goal_time,
+                       g.odds_30s, g.odds_60s, g.odds_120s, g.odds_300s,
+                       m.league
+                  FROM goals g
+                  JOIN matches m ON m.id = g.match_id
+                 WHERE g.goal_time > NOW() - INTERVAL '7 days'
+                 ORDER BY g.goal_time DESC
+                 LIMIT 100
+            """)
+            out["goals"] = [dict(r) for r in cur.fetchall()]
+
+            # Successful paper trades (signals that hit)
+            cur.execute("""
+                SELECT pt.minute_entry, pt.entry_odd, pt.verdict, pt.rule_name,
+                       pt.profit_loss, s.over_odd, s.over_05_ht_odd, s.over_15_ht_odd,
+                       s.opening_over, s.pressure_score, m.league
+                  FROM paper_trades pt
+                  JOIN signals s ON s.id = pt.signal_id
+                  JOIN matches m ON m.id = pt.match_id
+                 WHERE pt.result = 'success'
+                   AND pt.opened_at > NOW() - INTERVAL '7 days'
+                 ORDER BY pt.opened_at DESC
+                 LIMIT 50
+            """)
+            out["successful_signals"] = [dict(r) for r in cur.fetchall()]
+
+            # Failed paper trades (signals that missed)
+            cur.execute("""
+                SELECT pt.minute_entry, pt.entry_odd, pt.verdict, pt.rule_name,
+                       pt.profit_loss, s.over_odd, s.over_05_ht_odd, s.over_15_ht_odd,
+                       s.opening_over, s.pressure_score, m.league
+                  FROM paper_trades pt
+                  JOIN signals s ON s.id = pt.signal_id
+                  JOIN matches m ON m.id = pt.match_id
+                 WHERE pt.result = 'miss'
+                   AND pt.opened_at > NOW() - INTERVAL '7 days'
+                 ORDER BY pt.opened_at DESC
+                 LIMIT 50
+            """)
+            out["failed_signals"] = [dict(r) for r in cur.fetchall()]
+
+            # Aggregated rule performance
+            cur.execute("""
+                SELECT rule_name, action, total_signals, success_count,
+                       fail_count, success_rate
+                  FROM rules
+                 WHERE total_signals > 0
+                 ORDER BY total_signals DESC
+            """)
+            out["rule_performance"] = [dict(r) for r in cur.fetchall()]
+
+            # No-goal examples: snapshots that had high pressure but no goal
+            # within the next 5 minutes. These are "almost-traps".
+            cur.execute("""
+                SELECT s.minute, s.over_25, s.over_05_ht, s.over_15_ht,
+                       s.opening_over_25, s.expected_over25, s.pressure,
+                       s.direction, s.held_seconds, s.captured_at, m.league
+                  FROM odds_snapshots s
+                  JOIN matches m ON m.id = s.match_id
+                 WHERE s.pressure >= 50
+                   AND s.goal_300s = FALSE
+                   AND s.captured_at > NOW() - INTERVAL '7 days'
+                 ORDER BY s.captured_at DESC
+                 LIMIT 50
+            """)
+            out["no_goal_examples"] = [dict(r) for r in cur.fetchall()]
+
+            # Paper trade summary
+            cur.execute("""
+                SELECT result, COUNT(*) AS n,
+                       COALESCE(SUM(profit_loss), 0) AS pl
+                  FROM paper_trades
+                 WHERE opened_at > NOW() - INTERVAL '7 days'
+                 GROUP BY result
+            """)
+            for r in cur.fetchall():
+                out["paper_trade_summary"][r["result"]] = {
+                    "count": r["n"], "pl": float(r["pl"] or 0)
+                }
+    except Exception as e:
+        log.warning(f"_gather_pattern_data failed: {e}")
+    return out
 
 
 def claude_suggest_rules():
-    """Look at recent goals + the snapshots before them, and propose new rules."""
+    """Run a deep pattern-discovery analysis. Asks Claude to follow PapaGoal's
+    full system prompt and return structured JSON of patterns + new rules."""
     if not _anthropic_client:
         return None
-    with db_cursor(dict_rows=True) as cur:
-        cur.execute("""
-            SELECT g.minute, g.score_before, g.score_after,
-                   g.odds_30s, g.odds_60s, g.odds_120s, g.odds_300s
-              FROM goals g
-             WHERE g.goal_time > NOW() - INTERVAL '24 hours'
-             ORDER BY g.goal_time DESC
-             LIMIT 50
-        """)
-        goals = cur.fetchall()
-    if not goals:
+
+    data = _gather_pattern_data()
+
+    if not data["goals"] and not data["successful_signals"] and not data["failed_signals"]:
+        log.info("claude_suggest_rules: not enough data yet")
         return None
 
-    sample = json.dumps([dict(g) for g in goals], default=str, indent=1)[:6000]
-    prompt = f"""Here are the last {len(goals)} goals with the odds snapshots
-that preceded them at -30s / -60s / -2m / -5m. Look for patterns the current
-rule set may be missing.
+    # Trim to keep prompt size reasonable
+    sample = {
+        "goals_count": len(data["goals"]),
+        "goals_sample": data["goals"][:30],
+        "successful_signals_count": len(data["successful_signals"]),
+        "successful_signals_sample": data["successful_signals"][:20],
+        "failed_signals_count": len(data["failed_signals"]),
+        "failed_signals_sample": data["failed_signals"][:20],
+        "no_goal_examples_count": len(data["no_goal_examples"]),
+        "no_goal_examples_sample": data["no_goal_examples"][:15],
+        "rule_performance": data["rule_performance"],
+        "paper_trade_summary": data["paper_trade_summary"],
+    }
+    sample_json = json.dumps(sample, default=str, indent=1)[:14000]
 
-Data (truncated):
-{sample}
+    prompt = f"""Analyze the following PapaGoal data dump and produce structured JSON
+with discovered patterns, new rules to test, and improvements.
 
-Output ONLY a JSON list of up to 3 candidate rules:
-[{{"name":"...","condition":"plain English","action":"GOAL|TRAP|NO_GOAL","why":"..."}}]
-No prose, no markdown fences."""
-    text = claude_call(prompt, max_tokens=1200)
-    with db_cursor() as cur:
-        cur.execute("""
-            INSERT INTO ai_insights (insight_type, content, goals_analyzed)
-            VALUES ('rule_suggestions', %s, %s)
-        """, (text, len(goals)))
+The dataset includes:
+- {len(data['goals'])} goals from the last 7 days, each with odds snapshots at -30s / -60s / -2m / -5m before the goal
+- {len(data['successful_signals'])} signals that successfully predicted (paper-trade hit)
+- {len(data['failed_signals'])} signals that failed (paper-trade miss)
+- {len(data['no_goal_examples'])} high-pressure snapshots that did NOT lead to a goal within 5 minutes
+- Performance breakdown of every active rule
+
+DATA:
+{sample_json}
+
+Reply with ONLY a JSON object in this EXACT schema. No prose, no markdown fences:
+
+{{
+  "summary": "Hebrew summary of what was learned",
+  "goal_patterns": [
+    {{
+      "pattern_name": "",
+      "market": "",
+      "minute_range": "",
+      "score_state": "",
+      "opening_odds_range": "",
+      "current_odds_range": "",
+      "expected_odds_range": "",
+      "expected_vs_real_gap": "",
+      "pressure_condition": "",
+      "movement_condition": "",
+      "sample_size": 0,
+      "goal_within_2m_rate": 0,
+      "goal_within_5m_rate": 0,
+      "goal_within_10m_rate": 0,
+      "confidence": "low / medium / high",
+      "reason": ""
+    }}
+  ],
+  "no_goal_patterns": [
+    {{
+      "pattern_name": "",
+      "market": "",
+      "minute_range": "",
+      "odds_condition": "",
+      "movement_condition": "",
+      "sample_size": 0,
+      "no_goal_rate_10m": 0,
+      "confidence": "low / medium / high",
+      "reason": ""
+    }}
+  ],
+  "trap_patterns": [
+    {{
+      "pattern_name": "",
+      "market": "",
+      "minute_range": "",
+      "why_it_looked_good": "",
+      "why_it_failed": "",
+      "sample_size": 0,
+      "trap_rate": 0,
+      "confidence": "low / medium / high"
+    }}
+  ],
+  "new_rules_to_test": [
+    {{
+      "rule_name": "",
+      "signal_type": "goal / no_goal / trap",
+      "market": "",
+      "minute_min": 0,
+      "minute_max": 0,
+      "score_condition": "",
+      "opening_odds_min": 0,
+      "opening_odds_max": 0,
+      "current_odds_min": 0,
+      "current_odds_max": 0,
+      "expected_gap_min": 0,
+      "pressure_min": 0,
+      "held_seconds_min": 0,
+      "movement_condition": "",
+      "reason": "",
+      "confidence_estimate": 0
+    }}
+  ],
+  "rules_to_improve": [
+    {{
+      "existing_rule": "",
+      "problem": "",
+      "suggested_change": "",
+      "reason": ""
+    }}
+  ],
+  "missing_data": [
+    {{
+      "issue": "",
+      "why_it_matters": "",
+      "fix": ""
+    }}
+  ]
+}}
+
+All Hebrew text fields must be in Hebrew. All numeric fields must be numbers, not strings.
+If a section has no findings due to insufficient data, return an empty array for it
+and add an entry under missing_data explaining what's needed."""
+
+    text = claude_call(prompt, max_tokens=4000)
+
+    # Persist for the /insights page
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT INTO ai_insights (insight_type, content, goals_analyzed)
+                VALUES ('papagoal_analysis', %s, %s)
+            """, (text, len(data["goals"])))
+    except Exception as e:
+        log.warning(f"failed to persist insight: {e}")
     return text
 
 
