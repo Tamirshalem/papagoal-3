@@ -421,35 +421,80 @@ def fetch_oddsapi_events() -> list:
         return []
 
 
+def _fetch_oddsapi_odds_request(event_ids: list) -> tuple:
+    """One HTTP call. Returns (ok, status_code, data_or_none)."""
+    if not event_ids:
+        return True, 200, []
+    try:
+        r = requests.get(
+            f"{ODDSPAPI_BASE}/odds/multi",
+            params={
+                "apiKey": ODDSPAPI_KEY,
+                "eventIds": ",".join(str(x) for x in event_ids),
+                "bookmakers": "Bet365",
+            },
+            timeout=20,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("events") or [data]
+            return True, 200, data if isinstance(data, list) else []
+        return False, r.status_code, None
+    except Exception:
+        return False, 0, None
+
+
 def fetch_oddsapi_odds(event_ids: list) -> list:
-    """Get odds for a batch of event ids from Bet365."""
+    """Get odds for a list of event ids from Bet365.
+
+    Strategy: try the whole chunk first; if it fails with 400, recursively
+    bisect until we either find the bad ID(s) or get the good ones through.
+    Single bad IDs are logged once and skipped. This way one stale ID can't
+    break the whole batch."""
     if not event_ids or not ODDSPAPI_KEY:
         return []
-    # Batch in chunks. Smaller chunks keep URL length comfortable; some
-    # OddsAPI deployments reject very long query strings with 400.
+
     out = []
     chunk_size = 15
     for i in range(0, len(event_ids), chunk_size):
         chunk = event_ids[i:i + chunk_size]
-        try:
-            r = requests.get(
-                f"{ODDSPAPI_BASE}/odds/multi",
-                params={
-                    "apiKey": ODDSPAPI_KEY,
-                    "eventIds": ",".join(str(x) for x in chunk),
-                    "bookmakers": "Bet365",
-                },
-                timeout=20,
-            )
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict):
-                data = data.get("data") or data.get("events") or [data]
-            if isinstance(data, list):
-                out.extend(data)
-        except Exception as e:
-            log.warning(f"fetch_oddsapi_odds chunk failed ({len(chunk)} ids): {e}")
+        out.extend(_fetch_with_bisect(chunk))
     return out
+
+
+_BAD_EVENT_IDS: set = set()  # cache of confirmed bad IDs to skip on next loops
+
+
+def _fetch_with_bisect(ids: list, depth: int = 0) -> list:
+    """Recursively bisect a chunk on 400. Returns the odds rows we got."""
+    # Filter out IDs we already know are bad
+    ids = [x for x in ids if x not in _BAD_EVENT_IDS]
+    if not ids:
+        return []
+
+    ok, status, data = _fetch_oddsapi_odds_request(ids)
+    if ok:
+        return data or []
+
+    if status == 400:
+        if len(ids) == 1:
+            # Found a single bad ID -- mark and skip it
+            bad = ids[0]
+            if bad not in _BAD_EVENT_IDS:
+                _BAD_EVENT_IDS.add(bad)
+                log.info(f"OddsAPI: skipping bad event_id={bad}")
+            return []
+        # Bisect
+        mid = len(ids) // 2
+        left = _fetch_with_bisect(ids[:mid], depth + 1)
+        right = _fetch_with_bisect(ids[mid:], depth + 1)
+        return left + right
+
+    # Non-400 (network, timeout, 5xx) -- log once and move on
+    if depth == 0:
+        log.warning(f"fetch_oddsapi_odds chunk failed ({len(ids)} ids): HTTP {status}")
+    return []
 
 
 def _to_float(v: Any) -> Optional[float]:
