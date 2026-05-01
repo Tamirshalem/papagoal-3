@@ -637,7 +637,7 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 if not isinstance(entry, dict):
                     continue
                 try:
-                    line = float(entry.get("max", entry.get("line", 0)))
+                    line = float(entry.get("hdp", entry.get("max", entry.get("line", 0))))
                 except (ValueError, TypeError):
                     continue
                 ov = _to_float(entry.get("over"))
@@ -687,7 +687,7 @@ def parse_match_odds(item: dict) -> Optional[dict]:
                 if not isinstance(entry, dict):
                     continue
                 try:
-                    line = float(entry.get("max", entry.get("line", 0)))
+                    line = float(entry.get("hdp", entry.get("max", entry.get("line", 0))))
                 except (ValueError, TypeError):
                     continue
                 ov = _to_float(entry.get("over"))
@@ -2674,11 +2674,12 @@ def debug_markets():
     # Fetch odds for the first batch
     odds_data = fetch_oddsapi_odds(event_ids_to_try)
 
-    # Find the first event that has actual Bet365 markets with content.
-    # We don't filter by minute here -- a pre-match event with markets is
-    # just as useful for figuring out the data format.
+    # Phase 1: try to find a live match (minute != null) with markets.
+    # Phase 2: fall back to any match with markets if no live ones exist.
     chosen = None
     rejected_summary = []
+    pre_match_with_markets = None
+
     for raw in odds_data:
         bookmakers = raw.get("bookmakers") or {}
         bet365 = bookmakers.get("Bet365") or bookmakers.get("bet365") or []
@@ -2691,8 +2692,13 @@ def debug_markets():
         score = raw.get("score")
 
         if market_count > 0:
-            chosen = raw
-            break
+            if minute is not None:
+                # This is a LIVE match -- use it
+                chosen = raw
+                break
+            elif pre_match_with_markets is None:
+                # Remember as fallback
+                pre_match_with_markets = raw
 
         rejected_summary.append({
             "id": eid,
@@ -2701,6 +2707,10 @@ def debug_markets():
             "score": score,
             "market_count": market_count,
         })
+
+    # Use pre-match fallback if no live match was found
+    if chosen is None and pre_match_with_markets is not None:
+        chosen = pre_match_with_markets
 
     if not chosen:
         return jsonify({
