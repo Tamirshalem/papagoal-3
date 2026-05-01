@@ -425,10 +425,12 @@ def fetch_oddsapi_odds(event_ids: list) -> list:
     """Get odds for a batch of event ids from Bet365."""
     if not event_ids or not ODDSPAPI_KEY:
         return []
-    # Batch in chunks of 50 to be safe
+    # Batch in chunks. Smaller chunks keep URL length comfortable; some
+    # OddsAPI deployments reject very long query strings with 400.
     out = []
-    for i in range(0, len(event_ids), 50):
-        chunk = event_ids[i:i + 50]
+    chunk_size = 15
+    for i in range(0, len(event_ids), chunk_size):
+        chunk = event_ids[i:i + chunk_size]
         try:
             r = requests.get(
                 f"{ODDSPAPI_BASE}/odds/multi",
@@ -446,7 +448,7 @@ def fetch_oddsapi_odds(event_ids: list) -> list:
             if isinstance(data, list):
                 out.extend(data)
         except Exception as e:
-            log.warning(f"fetch_oddsapi_odds chunk failed: {e}")
+            log.warning(f"fetch_oddsapi_odds chunk failed ({len(chunk)} ids): {e}")
     return out
 
 
