@@ -18,7 +18,7 @@ app = Flask(__name__)
 
 # ─── Expected Curves ──────────────────────────────────────────────────────────
 EXPECTED = {
-    "H1_0.5": {0:1.25,5:1.28,10:1.32,15:1.38,20:1.45,25:1.55,30:1.68,35:1.85,40:2.10,45:2.50},
+    "H1_0.5": {0:1.25,5:1.28,10:1.32,15:1.38,20:1.45,25:z1.55,30:1.68,35:1.85,40:2.10,45:2.50},
     "H1_1.5": {0:2.10,5:2.15,10:2.22,15:2.32,20:2.45,25:2.65,30:2.90,35:3.20,40:3.60,45:4.20},
     "H1_2.5": {0:3.50,5:3.60,10:3.75,15:3.95,20:4.20,25:4.60,30:5.20,35:6.00,40:7.50,45:10.0},
     "FT_0.5": {0:1.10,10:1.12,20:1.15,30:1.20,40:1.28,50:1.38,60:1.55,70:1.85,80:2.50,88:4.00},
@@ -197,9 +197,11 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_score_away INT DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_total_goals INT DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS failure_reason TEXT",
-            # goals table — add TEXT match_id if missing (old schema had integer)
             "ALTER TABLE goals ADD COLUMN IF NOT EXISTS match_id_text TEXT",
+            "ALTER TABLE goals ADD COLUMN IF NOT EXISTS had_snapshots BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE goals ADD COLUMN IF NOT EXISTS odds_30s JSONB DEFAULT '{}'",
+            "ALTER TABLE goals ADD COLUMN IF NOT EXISTS odds_60s JSONB DEFAULT '{}'",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS failure_reason TEXT",
         ]:
             try: conn.run(q)
             except Exception as ce: log.debug(f"Migration: {ce}")
@@ -950,20 +952,24 @@ def collect():
 
                 match_id = f"oa_{eid}"
 
-                # Upsert match
+                # Upsert match — UPDATE first, then INSERT if not exists
                 try:
-                    conn.run("""INSERT INTO matches
-                        (match_id,event_id,league,home_team,away_team,minute,
-                         score_home,score_away,total_goals,period,status,last_updated_at)
-                        VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,NOW())
-                        ON CONFLICT (match_id) DO UPDATE SET
+                    updated = conn.run("""UPDATE matches SET
                         league=:c,home_team=:d,away_team=:e,
                         minute=:f,score_home=:g,score_away=:h,
-                        total_goals=:i,period=:j,status=:k,last_updated_at=NOW()""",
-                        a=match_id,b=eid,c=league,d=home,e=away,f=minute,
-                        g=score_h,h=score_a,i=total,
-                        j=period,k='live')
-                except: pass
+                        total_goals=:i,period=:j,status=:k,last_updated_at=NOW()
+                        WHERE match_id=:a""",
+                        a=match_id,c=league,d=home,e=away,f=minute,
+                        g=score_h,h=score_a,i=total,j=period,k='live')
+                    if not updated:
+                        conn.run("""INSERT INTO matches
+                            (match_id,event_id,league,home_team,away_team,minute,
+                             score_home,score_away,total_goals,period,status,last_updated_at)
+                            VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,NOW())""",
+                            a=match_id,b=eid,c=league,d=home,e=away,f=minute,
+                            g=score_h,h=score_a,i=total,j=period,k='live')
+                except Exception as me:
+                    log.debug(f"Match upsert: {me}")
 
                 # Detect goal
                 prev_goals = last_scores.get(match_id)
