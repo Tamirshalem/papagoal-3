@@ -6,7 +6,7 @@ import pg8000.native
 import requests
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-ODDSAPI_KEY       = os.environ.get("ODDSPAPI_KEY", "")
+ODDSAPI_KEY       = os.environ.get("ODDSAPI_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 PORT              = int(os.environ.get("PORT", 8080))
@@ -191,17 +191,24 @@ def init_db():
 
 def _seed_rules(conn):
     rules = [
+        # ── 1. Market Shut ─────────────────────────────────────────────────────
+        # 39-40 historical signals, 100% success. VALIDATED.
+        # Market believes no more goals late in the game.
         {
             "rule_name": "Market Shut",
-            "description": "Over FT >= 2.80 after min 82 → market believes no more goals",
-            "market_type": "FT", "line_min": 2.0, "line_max": 3.5,
+            "description": "Over FT ≥2.80 after min 82 → market believes no more goals",
+            "market_type": "FT", "line_min": 1.5, "line_max": 5.5,
             "minute_min": 82, "minute_max": 95,
             "over_odd_min": 2.80, "over_odd_max": 99.0,
             "under_odd_min": None, "under_odd_max": None,
             "action_type": "UNDER_HOLDS_10M", "selected_side": "under",
             "validation_window": "10m", "status": "VALIDATED",
-            "pressure_min": 0, "held_seconds_min": 0
+            "pressure_min": 0, "held_seconds_min": 0,
+            "score_condition": None,
         },
+        # ── 2. Early Drop ──────────────────────────────────────────────────────
+        # 9 historical signals, 100% success. PROMISING (small sample).
+        # Sharp drop in FT over odd early → goal coming soon.
         {
             "rule_name": "Early Drop Signal",
             "description": "Over FT drops to 1.50-1.57 at min 17-20 → goal very soon",
@@ -211,40 +218,50 @@ def _seed_rules(conn):
             "under_odd_min": None, "under_odd_max": None,
             "action_type": "OVER_LINE_WITHIN_10M", "selected_side": "over",
             "validation_window": "10m", "status": "PROMISING",
-            "pressure_min": 0, "held_seconds_min": 0
+            "pressure_min": 0, "held_seconds_min": 0,
+            "score_condition": None,
         },
+        # ── 3. H1 Goal Pressure Minute 18 ─────────────────────────────────────
+        # H1 market still believes another goal before HT.
         {
-            "rule_name": "H1 Minute 18 Pressure",
+            "rule_name": "H1 Minute 18 Goal Pressure",
             "description": "Over H1 next line 1.40-1.60 at min 15-22 → H1 goal before HT",
-            "market_type": "H1", "line_min": 0.5, "line_max": 2.5,
+            "market_type": "H1", "line_min": 0.5, "line_max": 3.5,
             "minute_min": 15, "minute_max": 22,
             "over_odd_min": 1.40, "over_odd_max": 1.60,
             "under_odd_min": None, "under_odd_max": None,
             "action_type": "H1_OVER_LINE_BEFORE_HT", "selected_side": "over",
             "validation_window": "HT", "status": "TESTING",
-            "pressure_min": 0, "held_seconds_min": 0
+            "pressure_min": 0, "held_seconds_min": 0,
+            "score_condition": None,
         },
+        # ── 4. H1 Under 1.66 Trap ─────────────────────────────────────────────
+        # Market expects H1 line to hold until HT.
         {
-            "rule_name": "H1 Under 1.66 Trap",
-            "description": "Under H1 ~1.66 at min 30-37 → no more H1 goals",
-            "market_type": "H1", "line_min": 0.5, "line_max": 2.5,
-            "minute_min": 30, "minute_max": 37,
+            "rule_name": "H1 Under 1.66 Minute 34",
+            "description": "Under H1 ~1.60-1.72 at min 30-38 → line holds to HT",
+            "market_type": "H1", "line_min": 0.5, "line_max": 3.5,
+            "minute_min": 30, "minute_max": 38,
             "over_odd_min": None, "over_odd_max": None,
             "under_odd_min": 1.60, "under_odd_max": 1.72,
             "action_type": "UNDER_HOLDS_TO_HT", "selected_side": "under",
             "validation_window": "HT", "status": "TESTING",
-            "pressure_min": 0, "held_seconds_min": 0
+            "pressure_min": 0, "held_seconds_min": 0,
+            "score_condition": None,
         },
+        # ── 5. Late FT Goal Hold ───────────────────────────────────────────────
+        # Late game, over ~2.50 held 60s+ → market still alive.
         {
             "rule_name": "Late FT Goal Hold",
             "description": "Over FT ~2.50 at min 86+ held 60s → goal before FT",
-            "market_type": "FT", "line_min": 1.5, "line_max": 3.5,
+            "market_type": "FT", "line_min": 1.5, "line_max": 4.5,
             "minute_min": 86, "minute_max": 95,
             "over_odd_min": 2.20, "over_odd_max": 2.80,
             "under_odd_min": None, "under_odd_max": None,
             "action_type": "OVER_LINE_BEFORE_FT", "selected_side": "over",
             "validation_window": "FT", "status": "TESTING",
-            "pressure_min": 0, "held_seconds_min": 60
+            "pressure_min": 0, "held_seconds_min": 60,
+            "score_condition": None,
         },
     ]
     for r in rules:
@@ -345,36 +362,97 @@ def parse_event(event, odds_data):
     if not odds_data:
         return result
 
-    bookmakers = odds_data.get("bookmakers") or {}
-    if isinstance(bookmakers, dict):
-        for bk_name, markets in bookmakers.items():
-            if not isinstance(markets, list): continue
-            for mkt in markets:
-                mname = (mkt.get("name") or "").upper().strip()
-                odds_list = mkt.get("odds") or []
-                if not odds_list: continue
-                odds = odds_list[0]
+    def _parse_bookmaker_markets(bk_markets):
+        """Parse a list of market dicts from one bookmaker into result['markets']"""
+        if not isinstance(bk_markets, list):
+            return
+        for mkt in bk_markets:
+            mname = (mkt.get("name") or mkt.get("market") or mkt.get("type") or "").upper().strip()
+            is_ou = ("OVER" in mname or "UNDER" in mname or "O/U" in mname
+                     or "TOTAL" in mname or "GOALS" in mname)
+            if not is_ou:
+                continue
+            market_type = "FT"
+            if "HALF" in mname or "HT" in mname or "H1" in mname or "1ST" in mname or "FIRST" in mname:
+                market_type = "H1"
 
-                # ML / 1X2
-                if mname in ["ML", "1X2", "MATCH WINNER", "MATCH RESULT"]:
-                    pass  # store if needed
+            # odds-api.io returns outcomes as list OR flat keys
+            outcomes = mkt.get("outcomes") or mkt.get("odds") or []
+            over_odd = under_odd = None
+            line_val = None
 
-                # Over/Under
-                elif "OVER" in mname or "UNDER" in mname or "O/U" in mname or "TOTAL" in mname:
-                    line = float(odds.get("max") or odds.get("line") or odds.get("total") or 2.5)
-                    over = float(odds.get("over") or 0)
-                    under = float(odds.get("under") or 0)
-                    if over > 1 or under > 1:
-                        # Determine H1 or FT
-                        market_type = "FT"
-                        if "HALF" in mname or "HT" in mname or "H1" in mname or "1ST" in mname:
-                            market_type = "H1"
-                        result["markets"].append({
-                            "market_type": market_type,
-                            "line": line,
-                            "over_odd": over if over > 1 else None,
-                            "under_odd": under if under > 1 else None
-                        })
+            if isinstance(outcomes, list):
+                for oc in outcomes:
+                    nm = (oc.get("name") or oc.get("label") or oc.get("type") or "").upper()
+                    val = oc.get("price") or oc.get("odd") or oc.get("value") or 0
+                    try:
+                        val = float(val)
+                    except:
+                        val = 0
+                    hdp = oc.get("handicap") or oc.get("line") or oc.get("total") or oc.get("points")
+                    if hdp is not None and line_val is None:
+                        try: line_val = float(hdp)
+                        except: pass
+                    if "OVER" in nm and val > 1:
+                        over_odd = val
+                    elif "UNDER" in nm and val > 1:
+                        under_odd = val
+            elif isinstance(outcomes, dict):
+                # flat dict: {"over": 1.85, "under": 1.95, "line": 2.5}
+                try: over_odd = float(outcomes.get("over") or 0) or None
+                except: pass
+                try: under_odd = float(outcomes.get("under") or 0) or None
+                except: pass
+                try: line_val = float(outcomes.get("line") or outcomes.get("total") or 0) or None
+                except: pass
+
+            # Try flat keys on the market itself
+            if over_odd is None:
+                try: over_odd = float(mkt.get("over") or 0) or None
+                except: pass
+            if under_odd is None:
+                try: under_odd = float(mkt.get("under") or 0) or None
+                except: pass
+            if line_val is None:
+                try: line_val = float(mkt.get("line") or mkt.get("total") or mkt.get("handicap") or mkt.get("points") or 2.5)
+                except: line_val = 2.5
+
+            if line_val is None:
+                line_val = 2.5
+
+            if over_odd and over_odd > 1:
+                result["markets"].append({
+                    "market_type": market_type,
+                    "line": round(line_val, 1),
+                    "over_odd": round(over_odd, 3),
+                    "under_odd": round(under_odd, 3) if under_odd and under_odd > 1 else None
+                })
+
+    # odds_data.bookmakers can be a dict {bkName: [...]} or a list [{name, markets:[]}]
+    bookmakers_raw = odds_data.get("bookmakers") or {}
+    if isinstance(bookmakers_raw, dict):
+        for _bk_name, bk_data in bookmakers_raw.items():
+            if isinstance(bk_data, list):
+                _parse_bookmaker_markets(bk_data)
+            elif isinstance(bk_data, dict):
+                _parse_bookmaker_markets(bk_data.get("markets") or [])
+    elif isinstance(bookmakers_raw, list):
+        for bk in bookmakers_raw:
+            if isinstance(bk, dict):
+                _parse_bookmaker_markets(bk.get("markets") or bk.get("odds") or [])
+
+    # Also check top-level markets key (some API responses flatten it)
+    if not result["markets"]:
+        _parse_bookmaker_markets(odds_data.get("markets") or [])
+
+    # Deduplicate: keep best (most complete) entry per market_type+line
+    seen = {}
+    for m in result["markets"]:
+        k = (m["market_type"], m["line"])
+        if k not in seen or (m["under_odd"] and not seen[k].get("under_odd")):
+            seen[k] = m
+    result["markets"] = list(seen.values())
+
     return result
 
 # ─── Rules Engine ─────────────────────────────────────────────────────────────
@@ -507,71 +585,77 @@ def validate_trades(conn):
             failure_reason = None
             profit = 0
 
-            # Get goals at entry time
+            # Goals at trade entry — use closest snapshot before trade was created
             try:
-                entry_goals = conn.run("""SELECT COUNT(*) FROM goals
-                    WHERE match_id=:a AND goal_time > :b""",
+                snap_at_entry = conn.run("""SELECT total_goals FROM odds_snapshots
+                    WHERE match_id=:a AND captured_at <= :b
+                    ORDER BY captured_at DESC LIMIT 1""",
                     a=mid, b=str(created_at))
-                goals_after = entry_goals[0][0] if entry_goals else 0
+                goals_at_entry = snap_at_entry[0][0] if snap_at_entry else 0
             except:
-                goals_after = 0
+                goals_at_entry = 0
 
-            # Validate based on action type
+            total_now = (cur_h or 0) + (cur_a or 0)
+            goals_since_entry = max(0, total_now - goals_at_entry)
+            line_crossed_now = total_now > line
+
+            # ── Validate by action type ─────────────────────────────────────
             if action_type == "OVER_LINE_WITHIN_10M":
-                if goals_after > 0 and cur_goals >= line:
+                if goals_since_entry > 0 and line_crossed_now:
                     result = "win"
                 elif elapsed_min > 12:
-                    result = "lose"; failure_reason = "No goal in 10 min"
+                    result = "lose"
+                    failure_reason = "No goal / line not crossed in 10min"
 
             elif action_type == "UNDER_HOLDS_10M":
-                if goals_after > 0:
-                    result = "lose"; failure_reason = "Goal scored – line crossed"
+                if goals_since_entry > 0 and line_crossed_now:
+                    result = "lose"; failure_reason = "Line crossed – goal scored"
                 elif elapsed_min > 12:
                     result = "win"
 
-            elif action_type == "H1_OVER_LINE_BEFORE_HT":
-                if cur_period in ["H2", "FT"] or (cur_period == "H1" and cur_min >= 45):
-                    # Check if line crossed during H1
-                    if (cur_h + cur_a) > line:
-                        result = "win"
-                    else:
-                        result = "lose"; failure_reason = "Line not crossed by HT"
+            elif action_type in ("H1_OVER_LINE_BEFORE_HT", "H1_GOAL_BEFORE_HT"):
+                h1_done = cur_period in ("H2", "FT") or (cur_period == "H1" and cur_min >= 46)
+                if h1_done:
+                    result = "win" if line_crossed_now else "lose"
+                    if result == "lose": failure_reason = "Line not crossed by HT"
+                elif elapsed_min > 65:
+                    result = "lose"; failure_reason = "HT timeout"
 
             elif action_type == "UNDER_HOLDS_TO_HT":
-                if cur_period in ["H2", "FT"] or (cur_period == "H1" and cur_min >= 45):
-                    if goals_after == 0:
-                        result = "win"
-                    else:
-                        result = "lose"; failure_reason = "Goal scored before HT"
+                h1_done = cur_period in ("H2", "FT") or (cur_period == "H1" and cur_min >= 46)
+                if h1_done:
+                    result = "win" if goals_since_entry == 0 else "lose"
+                    if result == "lose": failure_reason = "Goal scored before HT"
+                elif elapsed_min > 65:
+                    result = "lose"; failure_reason = "HT timeout"
 
-            elif action_type == "OVER_LINE_BEFORE_FT":
+            elif action_type in ("OVER_LINE_BEFORE_FT", "GOAL_BY_FT"):
                 if cur_period == "FT":
-                    if (cur_h + cur_a) > line:
-                        result = "win"
-                    else:
-                        result = "lose"; failure_reason = "Line not crossed by FT"
-                elif elapsed_min > 30:
-                    result = "lose"; failure_reason = "Timeout – no FT data"
+                    result = "win" if line_crossed_now else "lose"
+                    if result == "lose": failure_reason = "Line not crossed by FT"
+                elif elapsed_min > 35:
+                    result = "lose"; failure_reason = "FT timeout – no data"
 
             if result:
-                if result == "win":
-                    profit = round((entry_odd - 1) * 100, 2)
-                else:
-                    profit = -100
-
+                profit = round((entry_odd - 1) * 100, 2) if result == "win" else -100.0
                 conn.run("""UPDATE paper_trades SET result=:a, resolved_at=NOW(),
                     dummy_profit_loss=:b, failure_reason=:c WHERE id=:d""",
                     a=result, b=profit, c=failure_reason, d=tid)
 
-                # Update rule stats
+                # Update rule win/lose + win_rate
                 try:
-                    conn.run(f"""UPDATE rules SET
-                        {'win_count=win_count+1' if result=='win' else 'lose_count=lose_count+1'},
-                        win_rate=CASE WHEN (win_count+lose_count)>0
-                            THEN ROUND((win_count{'+ 1' if result=='win' else ''})::float/(win_count+lose_count+1)*100,1)
-                            ELSE 0 END,
-                        dummy_profit=dummy_profit+:a, last_updated=NOW()
-                        WHERE id=:b""", a=profit, b=rid)
+                    if result == "win":
+                        conn.run("""UPDATE rules SET win_count=win_count+1,
+                            win_rate=ROUND((win_count+1)::float/(win_count+lose_count+1)*100,1),
+                            dummy_profit=dummy_profit+:a, last_updated=NOW()
+                            WHERE id=:b""", a=profit, b=rid)
+                    else:
+                        conn.run("""UPDATE rules SET lose_count=lose_count+1,
+                            win_rate=CASE WHEN (win_count+lose_count+1)>0
+                                THEN ROUND(win_count::float/(win_count+lose_count+1)*100,1)
+                                ELSE 0 END,
+                            dummy_profit=dummy_profit+:a, last_updated=NOW()
+                            WHERE id=:b""", a=profit, b=rid)
                 except: pass
 
                 log.info(f"{'✅' if result=='win' else '❌'} Trade {result}: {rname} | profit:{profit}")
@@ -858,6 +942,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
     <button class="nav-item" onclick="show('rules',this)"><span>📋</span><span>Rules Engine</span></button>
     <button class="nav-item" onclick="show('analytics',this)"><span>📊</span><span>Analytics</span></button>
     <button class="nav-item" onclick="show('ai',this)"><span>🤖</span><span>AI Insights</span></button>
+    <button class="nav-item" onclick="show('debug',this)"><span>🔧</span><span>API Debug</span></button>
   </nav>
 </div>
 <div class="main">
@@ -916,8 +1001,15 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
   <div id="ai-content"><div class="empty"><div style="font-size:42px">🤖</div><div>Click Run Analysis to get insights</div></div></div>
 </div>
 
+<div class="page" id="p-debug">
+  <div class="ph">
+    <div><div class="pt">🔧 API Debug</div><div class="ps">Raw response from odds-api.io — diagnose parsing issues</div></div>
+    <button class="abtn" onclick="loadDebug()">🔄 Fetch Now</button>
+  </div>
+  <div id="debug-content"><div class="empty"><div style="font-size:42px">🔧</div><div>Click Fetch Now to inspect the API response</div></div></div>
 </div>
-<script>
+
+</div>
 let cur='live';
 const statusClass={'VALIDATED':'s-validated','PROMISING':'s-promising','TESTING':'s-testing','ACTIVE':'s-active','REJECTED':'s-rejected','DANGEROUS':'s-dangerous'};
 
@@ -927,7 +1019,7 @@ function show(p,btn){
   document.getElementById('p-'+p).classList.add('active');
   if(btn) btn.classList.add('active');
   cur=p;
-  const fn={goals:loadGoals,trades:loadTrades,obs:loadObs,rules:loadRules,analytics:loadAnalytics,ai:loadAI};
+  const fn={goals:loadGoals,trades:loadTrades,obs:loadObs,rules:loadRules,analytics:loadAnalytics,ai:loadAI,debug:loadDebug};
   if(fn[p]) fn[p]();
 }
 
@@ -1087,33 +1179,52 @@ async function loadRules(){
   document.getElementById('rv').textContent=rules.filter(r=>r.status==='VALIDATED').length;
   document.getElementById('rt').textContent=rules.reduce((s,r)=>s+(r.total_signals||0),0);
   const prof=rules.reduce((s,r)=>s+(r.dummy_profit||0),0);
-  document.getElementById('rp').textContent='€'+prof.toFixed(0);
+  document.getElementById('rp').textContent=(prof>=0?'+':'')+'€'+prof.toFixed(0);
   if(!rules.length){el.innerHTML='<div class="empty">No rules</div>';return;}
   el.innerHTML=rules.map(r=>{
-    const wr=r.win_rate||0;
+    const wr=parseFloat(r.win_rate||0);
     const wc=wr>=60?'var(--green)':wr>=45?'var(--yellow)':'var(--red)';
-    const total=r.win_count+r.lose_count;
-    return `<div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:8px">
+    const resolved=(r.win_count||0)+(r.lose_count||0);
+    const pending=(r.total_signals||0)-resolved;
+    const prof=r.dummy_profit||0;
+    const sideLabel=r.selected_side==='under'?'⬇ UNDER':'⬆ OVER';
+    const sideColor=r.selected_side==='under'?'var(--purple)':'var(--green)';
+    // Conditions summary
+    const oddRange=r.selected_side==='under'
+      ?`Under ${r.under_odd_min||'?'}–${r.under_odd_max||'?'}`
+      :`Over ${r.over_odd_min||'?'}–${r.over_odd_max||'?'}`;
+    return `<div class="card" style="border-color:${r.is_active?'var(--border2)':'var(--border)'}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px">
         <div style="flex:1">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
-            <span style="font-size:14px;font-weight:700;color:${r.is_active?'var(--text)':'var(--muted)'}">${r.source==='ai'?'🤖 ':''}${r.rule_name}</span>
+            <span style="font-size:14px;font-weight:700;color:${r.is_active?'var(--text)':'var(--muted)'}">${r.source==='ai'?'🤖 ':'📋 '}${r.rule_name}</span>
             <span class="status-badge ${statusClass[r.status]||'s-active'}">${r.status}</span>
+            <span style="font-size:11px;font-weight:700;color:${sideColor};font-family:'JetBrains Mono',monospace">${sideLabel}</span>
           </div>
-          <div style="font-size:11px;color:var(--muted)">${r.description||''}</div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${r.description||''}</div>
+          <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;display:flex;gap:12px;flex-wrap:wrap">
+            <span>📅 min ${r.minute_min}–${r.minute_max}</span>
+            <span>📊 ${r.market_type} ${r.line_min}–${r.line_max}</span>
+            <span>💰 ${oddRange}</span>
+            <span>⏱ window: ${r.validation_window}</span>
+            <span>🎯 ${r.action_type}</span>
+          </div>
         </div>
         <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule('${r.rule_name}',${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
       </div>
-      <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
-        <div style="flex:1"><div class="pb6"><div class="pf6" style="width:${wr}%;background:${wc}"></div></div></div>
-        <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:${wc};width:38px;text-align:right">${wr}%</span>
-        <span style="font-size:11px;color:var(--muted)">${r.total_signals||0} signals</span>
-        <span style="font-size:11px;color:var(--green)">✅${r.win_count||0}</span>
-        <span style="font-size:11px;color:var(--red)">❌${r.lose_count||0}</span>
-        <span style="font-size:11px;color:${(r.dummy_profit||0)>=0?'var(--green)':'var(--red)'}">€${(r.dummy_profit||0).toFixed(0)}</span>
-      </div>
-      <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:6px">
-        ${r.market_type} · min ${r.minute_min}-${r.minute_max} · ${r.action_type} · ${r.validation_window}
+      <div style="background:var(--bg2);border-radius:8px;padding:10px;margin-top:8px">
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;text-align:center;margin-bottom:8px">
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--blue)">${r.total_signals||0}</div><div style="font-size:10px;color:var(--muted)">SIGNALS</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--green)">${r.win_count||0}</div><div style="font-size:10px;color:var(--muted)">WON</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--red)">${r.lose_count||0}</div><div style="font-size:10px;color:var(--muted)">LOST</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--yellow)">${pending}</div><div style="font-size:10px;color:var(--muted)">PENDING</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:${prof>=0?'var(--green)':'var(--red)'}">${prof>=0?'+':''}€${prof.toFixed(0)}</div><div style="font-size:10px;color:var(--muted)">P&L</div></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1"><div class="pb6"><div class="pf6" style="width:${Math.min(100,wr)}%;background:${wc}"></div></div></div>
+          <span style="font-size:13px;font-family:'JetBrains Mono',monospace;font-weight:700;color:${wc};width:44px;text-align:right">${wr.toFixed(1)}%</span>
+          <span style="font-size:10px;color:var(--muted)">${resolved} resolved</span>
+        </div>
       </div>
     </div>`;
   }).join('');
@@ -1193,6 +1304,34 @@ async function runAI(){
     else{await loadAI();btn.textContent='✅ Done';}
   }catch(e){btn.textContent='❌ Error';}
   setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
+}
+
+async function loadDebug(){
+  const el=document.getElementById('debug-content');
+  el.innerHTML='<div class="empty">⏳ Fetching...</div>';
+  try{
+    const d=await fetch('/api/debug_odds').then(r=>r.json());
+    const mkts=(d.parsed?.markets||[]).map(m=>`
+      <div style="background:var(--bg2);border-radius:6px;padding:8px 12px;margin:4px 0;font-family:'JetBrains Mono',monospace;font-size:12px;display:flex;gap:16px;flex-wrap:wrap">
+        <span style="color:var(--blue)">${m.market_type}</span>
+        <span>Line: <b>${m.line}</b></span>
+        <span style="color:var(--green)">Over: ${m.over_odd||'—'}</span>
+        <span style="color:var(--red)">Under: ${m.under_odd||'—'}</span>
+      </div>`).join('');
+    el.innerHTML=`
+      <div class="card">
+        <div class="stit">Parsed Markets (${d.markets_found||0} found) — ${d.total_events||0} live events</div>
+        ${d.markets_found>0?mkts:'<div style="color:var(--red);padding:12px">⚠️ NO MARKETS PARSED — check raw JSON below</div>'}
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div class="stit">Raw Odds Response</div>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:300px;white-space:pre-wrap;font-family:\'JetBrains Mono\',monospace">${JSON.stringify(d.odds_raw,null,2)}</pre>
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div class="stit">Raw Event</div>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:200px;white-space:pre-wrap;font-family:\'JetBrains Mono\',monospace">${JSON.stringify(d.event_raw,null,2)}</pre>
+      </div>`;
+  }catch(e){el.innerHTML=`<div class="empty">Error: ${e.message}</div>`;}
 }
 
 async function auto(){if(cur==='live') await loadLive();}
@@ -1532,12 +1671,33 @@ Only suggest rules with clear data support. Max 3 new rules."""
 
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","version":"v5","time":datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status":"ok","version":"v6","time":datetime.now(timezone.utc).isoformat()})
+
+@app.route("/api/debug_odds")
+def api_debug_odds():
+    """Show raw API response for the first live event – for diagnosing parse issues"""
+    try:
+        events = fetch_events()
+        if not events:
+            return jsonify({"error": "No live events from API"})
+        eid = str(events[0].get("id") or events[0].get("eventId") or "")
+        odds_batch = fetch_odds_multi([eid]) if eid else []
+        odds_raw = odds_batch[0] if odds_batch else {}
+        parsed = parse_event(events[0], odds_raw)
+        return jsonify({
+            "event_raw": events[0],
+            "odds_raw": odds_raw,
+            "parsed": parsed,
+            "markets_found": len(parsed.get("markets", [])),
+            "total_events": len(events)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 init_db()
 threading.Thread(target=collector_loop, daemon=True).start()
-log.info("🚀 PapaGoal v5 started")
+log.info("🚀 PapaGoal v6 started")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
