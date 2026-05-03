@@ -439,28 +439,43 @@ def fetch_odds_multi(event_ids):
 
 def parse_event(event, odds_data):
     """Parse event + odds into structured format"""
+    # League can be string or object
+    league_raw = event.get("league") or ""
+    league = league_raw.get("name", "") if isinstance(league_raw, dict) else str(league_raw)
+
     result = {
         "event_id": str(event.get("id") or ""),
         "home": event.get("home") or event.get("homeTeam") or "",
         "away": event.get("away") or event.get("awayTeam") or "",
-        "league": event.get("league") or event.get("competition") or "",
-        "minute": 0, "score_home": 0, "score_away": 0, "period": "FT",
-        "markets": []  # list of {market_type, line, over_odd, under_odd}
+        "league": league,
+        "minute": 0, "score_home": 0, "score_away": 0, "period": "H1",
+        "markets": []
     }
 
-    # Extract live score/minute from event
-    status = event.get("status") or event.get("liveData") or {}
-    if isinstance(status, dict):
-        result["minute"] = int(status.get("minute") or status.get("elapsed") or 0)
-        score = status.get("score") or status.get("result") or {}
-        if isinstance(score, dict):
-            result["score_home"] = int(score.get("home") or score.get("homeScore") or 0)
-            result["score_away"] = int(score.get("away") or score.get("awayScore") or 0)
-        period = status.get("period") or status.get("half") or ""
-        if "1" in str(period) or "first" in str(period).lower():
-            result["period"] = "H1"
-        elif "2" in str(period) or "second" in str(period).lower():
+    # scores: {"home": 1, "away": 2, "periods": {"p1": {...}}}
+    scores = event.get("scores") or event.get("score") or {}
+    if isinstance(scores, dict):
+        result["score_home"] = int(scores.get("home") or 0)
+        result["score_away"] = int(scores.get("away") or 0)
+        # Determine period from periods data
+        periods = scores.get("periods") or {}
+        if "p2" in periods or (isinstance(periods, dict) and len(periods) >= 2):
             result["period"] = "H2"
+        elif "p1" in periods:
+            result["period"] = "H1"
+
+    # minute from liveData or elapsed
+    live = event.get("liveData") or event.get("status_data") or {}
+    if isinstance(live, dict):
+        result["minute"] = int(live.get("minute") or live.get("elapsed") or 0)
+    # fallback: estimate from time if no minute
+    if result["minute"] == 0:
+        try:
+            from datetime import datetime, timezone
+            start = datetime.fromisoformat(event.get("date","").replace("Z","+00:00"))
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds() / 60
+            result["minute"] = max(0, min(90, int(elapsed)))
+        except: pass
 
     # Parse odds from odds_data
     if not odds_data:
@@ -1156,6 +1171,8 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
   </div>
   <div class="stit">🎯 Active Recommendations</div>
   <div id="live-cards"><div class="empty"><div style="font-size:42px">📡</div><div>Scanning live matches...</div></div></div>
+  <div class="stit" style="margin-top:20px">📡 All Live Matches</div>
+  <div id="all-matches"><div class="empty" style="padding:20px">Loading matches...</div></div>
 </div>
 
 <div class="page" id="p-goals">
@@ -1225,10 +1242,11 @@ function show(p,btn){
 
 async function loadLive(){
   try{
-    const[st,obs,ai]=await Promise.all([
+    const[st,obs,ai,matches]=await Promise.all([
       fetch('/api/stats').then(r=>r.json()),
       fetch('/api/signals').then(r=>r.json()),
-      fetch('/api/ai_live').then(r=>r.json())
+      fetch('/api/ai_live').then(r=>r.json()),
+      fetch('/api/matches').then(r=>r.json())
     ]);
     document.getElementById('sl').textContent=st.live||0;
     document.getElementById('sh').textContent=st.signals||0;
@@ -1238,45 +1256,50 @@ async function loadLive(){
     const aiMap={};ai.forEach(a=>aiMap[a.match_id]=a.analysis);
     const el=document.getElementById('live-cards');
     if(!obs.length){
-      el.innerHTML='<div class="empty"><div style="font-size:42px">✅</div><div style="font-size:15px;font-weight:700;margin:8px 0">No active signals</div><div>Watching '+(st.live||0)+' live matches</div></div>';
-      return;
-    }
-    // Group by match
-    const bm={};
-    obs.forEach(o=>{
-      if(!bm[o.match_id]) bm[o.match_id]={...o,signals:[]};
-      bm[o.match_id].signals.push(o);
-    });
-    el.innerHTML=Object.values(bm).map(m=>{
-      const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px;font-family:'JetBrains Mono',monospace">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
-      const sigs=m.signals.map(s=>`
-        <div class="rec-box">
+      el.innerHTML='<div class="empty"><div style="font-size:36px">✅</div><div>No active signals yet</div></div>';
+    } else {
+      const bm={};
+      obs.forEach(o=>{if(!bm[o.match_id]) bm[o.match_id]={...o,signals:[]};bm[o.match_id].signals.push(o);});
+      el.innerHTML=Object.values(bm).map(m=>{
+        const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
+        const sigs=m.signals.map(s=>`<div class="rec-box">
           <div class="rec-title">🎯 ${s.action_type} · ${s.rule_name}</div>
           <div class="rec-row">
             <span>Market: <span class="rec-val">${s.market_type} ${s.line}</span></span>
-            <span>Side: <span class="rec-val">${s.selected_side?.toUpperCase()}</span></span>
+            <span>Side: <span class="rec-val">${(s.selected_side||'').toUpperCase()}</span></span>
             <span>Odd: <span class="rec-val" style="color:var(--yellow)">${s.entry_odd||'—'}</span></span>
-            <span>Expected: <span class="rec-val">${s.expected_odd||'—'}</span></span>
             <span>Gap: <span class="rec-val" style="color:${(s.gap||0)>0?'var(--green)':'var(--red)'}">${s.gap||0}</span></span>
             <span>Pressure: <span class="rec-val">${s.pressure||0}%</span></span>
-            <span>Conf: <span class="rec-val">${s.confidence||50}%</span></span>
             <span style="color:var(--green)">📈 Paper Trade Created</span>
           </div>
-          ${(s.pressure||0)>0?`<div class="pbar"><div class="pfill" style="width:${s.pressure}%;background:var(--blue)"></div></div>`:''}
         </div>`).join('');
-      return `<div class="card ${m.signals.some(s=>(s.pressure||0)>=60)?'hot':'goal'}">
-        <div class="ctop">
-          <div><div class="mn">${m.home_team} vs ${m.away_team}</div><div class="ml">${m.league||''}</div></div>
+        return `<div class="card hot">
+          <div class="ctop">
+            <div><div class="mn">${m.home_team} vs ${m.away_team}</div><div class="ml">${m.league||''}</div></div>
+            <div class="bgs">
+              ${m.minute>0?`<span class="bg bgb">⏱ ${m.minute}'</span>`:''}
+              ${m.score&&m.score!='0-0'?`<span class="bg bgy">${m.score}</span>`:''}
+              <span class="bg bgg">🎯 SIGNAL</span>
+            </div>
+          </div>${sigs}${ai}</div>`;
+      }).join('');
+    }
+    // Show all matches
+    const mel=document.getElementById('all-matches');
+    if(!matches.length){
+      mel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">No matches in DB yet — waiting for first collection cycle</div>';
+    } else {
+      mel.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">'+
+        matches.map(m=>`<div class="card" style="padding:12px">
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px">${m.home_team} vs ${m.away_team}</div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">${m.league||'Unknown League'}</div>
           <div class="bgs">
-            ${m.minute>0?`<span class="bg bgb">⏱ ${m.minute}'</span>`:''}
-            ${m.score&&m.score!='0-0'?`<span class="bg bgy">${m.score}</span>`:''}
-            <span class="bg bgb">LIVE</span>
+            <span class="bg bgb">⏱ ${m.minute}'</span>
+            <span class="bg bgy">${m.score_home}-${m.score_away}</span>
+            <span class="bg ${m.period==='H1'?'bgb':m.period==='H2'?'bgp':'bgg'}">${m.period}</span>
           </div>
-        </div>
-        ${sigs}
-        ${ai}
-      </div>`;
-    }).join('');
+        </div>`).join('')+'</div>';
+    }
   }catch(e){console.error(e);}
 }
 
@@ -1542,12 +1565,32 @@ loadLive();setInterval(auto,20000);
 @app.route("/")
 def index(): return render_template_string(HTML)
 
+@app.route("/api/matches")
+def api_matches():
+    try:
+        conn=get_db()
+        try:
+            rows=conn.run("""SELECT match_id,home_team,away_team,league,
+                minute,score_home,score_away,total_goals,period,status,last_updated
+                FROM matches WHERE status='live' AND last_updated>NOW()-INTERVAL '5 minutes'
+                ORDER BY last_updated DESC LIMIT 100""")
+            return jsonify([{
+                "match_id":r[0],"home_team":r[1]or"","away_team":r[2]or"",
+                "league":r[3]or"","minute":r[4]or 0,
+                "score_home":r[5]or 0,"score_away":r[6]or 0,
+                "total_goals":r[7]or 0,"period":r[8]or"FT",
+                "status":r[9]or"","last_updated":str(r[10])
+            } for r in rows])
+        finally: conn.close()
+    except Exception as e:
+        return jsonify([])
+
 @app.route("/api/stats")
 def api_stats():
     try:
         conn=get_db()
         try:
-            r1=conn.run("SELECT COUNT(DISTINCT match_id) FROM odds_snapshots WHERE captured_at>NOW()-INTERVAL '1 hour' AND is_live=TRUE")
+            r1=conn.run("SELECT COUNT(*) FROM matches WHERE status='live' AND last_updated>NOW()-INTERVAL '2 minutes'")
             r2=conn.run("SELECT COUNT(*) FROM observations WHERE detected_at>NOW()-INTERVAL '30 minutes'")
             r3=conn.run("SELECT COUNT(*) FROM goals WHERE goal_time>NOW()-INTERVAL '24 hours'")
             r4=conn.run("SELECT COUNT(*) FROM paper_trades WHERE result='pending'")
