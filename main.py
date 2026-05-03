@@ -925,11 +925,12 @@ def collect():
                          score_home,score_away,total_goals,period,status,last_updated)
                         VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,NOW())
                         ON CONFLICT (match_id) DO UPDATE SET
-                        league=:c,minute=:f,score_home=:g,score_away=:h,
+                        league=:c,home_team=:d,away_team=:e,
+                        minute=:f,score_home=:g,score_away=:h,
                         total_goals=:i,period=:j,status=:k,last_updated=NOW()""",
                         a=match_id,b=eid,c=league,d=home,e=away,f=minute,
                         g=score_h,h=score_a,i=total,
-                        j=period,k='live' if is_live else 'upcoming')
+                        j=period,k='live')
                 except: pass
 
                 # Detect goal
@@ -1570,9 +1571,10 @@ def api_matches():
     try:
         conn=get_db()
         try:
+            # Try live first, fallback to all recent
             rows=conn.run("""SELECT match_id,home_team,away_team,league,
                 minute,score_home,score_away,total_goals,period,status,last_updated
-                FROM matches WHERE status='live' AND last_updated>NOW()-INTERVAL '5 minutes'
+                FROM matches WHERE last_updated>NOW()-INTERVAL '10 minutes'
                 ORDER BY last_updated DESC LIMIT 100""")
             return jsonify([{
                 "match_id":r[0],"home_team":r[1]or"","away_team":r[2]or"",
@@ -1583,6 +1585,7 @@ def api_matches():
             } for r in rows])
         finally: conn.close()
     except Exception as e:
+        log.error(f"api_matches: {e}")
         return jsonify([])
 
 @app.route("/api/stats")
@@ -1590,7 +1593,7 @@ def api_stats():
     try:
         conn=get_db()
         try:
-            r1=conn.run("SELECT COUNT(*) FROM matches WHERE status='live' AND last_updated>NOW()-INTERVAL '2 minutes'")
+            r1=conn.run("SELECT COUNT(*) FROM matches WHERE last_updated>NOW()-INTERVAL '3 minutes'")
             r2=conn.run("SELECT COUNT(*) FROM observations WHERE detected_at>NOW()-INTERVAL '30 minutes'")
             r3=conn.run("SELECT COUNT(*) FROM goals WHERE goal_time>NOW()-INTERVAL '24 hours'")
             r4=conn.run("SELECT COUNT(*) FROM paper_trades WHERE result='pending'")
