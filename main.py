@@ -50,6 +50,59 @@ def calc_pressure(real_odd, opening_odd, expected_odd):
     if exp_rise <= 0: return 0
     return max(0, min(100, int((1 - rise / exp_rise) * 100)))
 
+
+# ─── Safe DB Migrations ───────────────────────────────────────────────────────
+def _safe_migrate(conn):
+    """Add missing columns to existing tables — safe to run on every startup."""
+    migrations = [
+        # odds_snapshots — columns added in v6
+        ("odds_snapshots", "market_type",       "TEXT"),
+        ("odds_snapshots", "line",               "FLOAT"),
+        ("odds_snapshots", "bookmaker",          "TEXT DEFAULT 'Bet365'"),
+        ("odds_snapshots", "over_odd",           "FLOAT"),
+        ("odds_snapshots", "under_odd",          "FLOAT"),
+        ("odds_snapshots", "opening_over",       "FLOAT"),
+        ("odds_snapshots", "opening_under",      "FLOAT"),
+        ("odds_snapshots", "prev_over",          "FLOAT"),
+        ("odds_snapshots", "prev_under",         "FLOAT"),
+        ("odds_snapshots", "delta_over",         "FLOAT DEFAULT 0"),
+        ("odds_snapshots", "delta_under",        "FLOAT DEFAULT 0"),
+        ("odds_snapshots", "direction",          "TEXT DEFAULT 'stable'"),
+        ("odds_snapshots", "held_seconds",       "INT DEFAULT 0"),
+        ("odds_snapshots", "expected_over",      "FLOAT"),
+        ("odds_snapshots", "gap_over",           "FLOAT DEFAULT 0"),
+        ("odds_snapshots", "gap_ratio_over",     "FLOAT DEFAULT 1"),
+        ("odds_snapshots", "pressure_score",     "INT DEFAULT 0"),
+        ("odds_snapshots", "movement_type",      "TEXT DEFAULT 'stable'"),
+        ("odds_snapshots", "reversal_detected",  "BOOLEAN DEFAULT FALSE"),
+        ("odds_snapshots", "frozen_market",      "BOOLEAN DEFAULT FALSE"),
+        ("odds_snapshots", "is_live",            "BOOLEAN DEFAULT FALSE"),
+        ("odds_snapshots", "goal_2m",            "BOOLEAN DEFAULT FALSE"),
+        ("odds_snapshots", "goal_5m",            "BOOLEAN DEFAULT FALSE"),
+        ("odds_snapshots", "goal_10m",           "BOOLEAN DEFAULT FALSE"),
+        # matches — extra columns
+        ("matches", "event_id",                  "TEXT"),
+        ("matches", "fixture_id",                "TEXT"),
+        ("matches", "total_goals",               "INT DEFAULT 0"),
+        # rules — extra columns
+        ("rules", "avg_entry_odd",               "FLOAT DEFAULT 0"),
+        ("rules", "false_positive_rate",         "FLOAT DEFAULT 0"),
+        ("rules", "pressure_min",                "INT DEFAULT 0"),
+        ("rules", "held_seconds_min",            "INT DEFAULT 0"),
+        ("rules", "movement_condition",          "TEXT"),
+        ("rules", "score_condition",             "TEXT"),
+        # paper_trades
+        ("paper_trades", "observation_id",       "INT"),
+        ("paper_trades", "confidence_estimate",  "INT DEFAULT 50"),
+        ("paper_trades", "movement_type",        "TEXT"),
+        ("paper_trades", "failure_reason",       "TEXT"),
+    ]
+    for table, col, col_type in migrations:
+        try:
+            conn.run(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {col_type}")
+        except Exception as e:
+            log.debug(f"Migration skip {table}.{col}: {e}")
+
 # ─── DB ───────────────────────────────────────────────────────────────────────
 def parse_db(url):
     p = urlparse(url)
@@ -91,9 +144,17 @@ def init_db():
             goal_2m BOOLEAN DEFAULT FALSE, goal_5m BOOLEAN DEFAULT FALSE,
             goal_10m BOOLEAN DEFAULT FALSE
         )""")
-        conn.run("CREATE INDEX IF NOT EXISTS idx_snap_match ON odds_snapshots(match_id)")
-        conn.run("CREATE INDEX IF NOT EXISTS idx_snap_time ON odds_snapshots(captured_at)")
-        conn.run("CREATE INDEX IF NOT EXISTS idx_snap_market ON odds_snapshots(market_type, line)")
+        # Safe migrations — add missing columns to existing tables
+        _safe_migrate(conn)
+
+        # Indexes — each wrapped so one failure doesn't block the rest
+        for _idx in [
+            "CREATE INDEX IF NOT EXISTS idx_snap_match   ON odds_snapshots(match_id)",
+            "CREATE INDEX IF NOT EXISTS idx_snap_time    ON odds_snapshots(captured_at)",
+            "CREATE INDEX IF NOT EXISTS idx_snap_market  ON odds_snapshots(market_type, line)",
+        ]:
+            try: conn.run(_idx)
+            except Exception as _e: log.warning(f"Index skip: {_e}")
         conn.run("""CREATE TABLE IF NOT EXISTS goals (
             id SERIAL PRIMARY KEY, match_id TEXT,
             minute INT, goal_time TIMESTAMPTZ DEFAULT NOW(),
@@ -1010,6 +1071,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 </div>
 
 </div>
+<script>
 let cur='live';
 const statusClass={'VALIDATED':'s-validated','PROMISING':'s-promising','TESTING':'s-testing','ACTIVE':'s-active','REJECTED':'s-rejected','DANGEROUS':'s-dangerous'};
 
@@ -1325,11 +1387,11 @@ async function loadDebug(){
       </div>
       <div class="card" style="margin-top:10px">
         <div class="stit">Raw Odds Response</div>
-        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:300px;white-space:pre-wrap;font-family:\'JetBrains Mono\',monospace">${JSON.stringify(d.odds_raw,null,2)}</pre>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:300px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.odds_raw,null,2)}</pre>
       </div>
       <div class="card" style="margin-top:10px">
         <div class="stit">Raw Event</div>
-        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:200px;white-space:pre-wrap;font-family:\'JetBrains Mono\',monospace">${JSON.stringify(d.event_raw,null,2)}</pre>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:200px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.event_raw,null,2)}</pre>
       </div>`;
   }catch(e){el.innerHTML=`<div class="empty">Error: ${e.message}</div>`;}
 }
