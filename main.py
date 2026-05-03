@@ -366,7 +366,7 @@ def fetch_events():
         return []
     try:
         r = requests.get("https://api.odds-api.io/v3/events",
-            params={"apiKey": ODDSAPI_KEY, "sport": "soccer", "status": "live", "limit": 50},
+            params={"apiKey": ODDSAPI_KEY, "sport": "football", "status": "live", "limit": 50},
             timeout=15)
         if r.status_code != 200:
             log.warning(f"OddsAPI events HTTP {r.status_code}: {r.text[:300]}")
@@ -1743,9 +1743,19 @@ def api_debug_odds():
     """Show raw API response — for diagnosing parse/auth issues"""
     out = {"api_key_set": bool(ODDSAPI_KEY), "api_key_prefix": ODDSAPI_KEY[:8]+"..." if ODDSAPI_KEY else "MISSING"}
     try:
+        # Step 0: get available sports
+        try:
+            rs = requests.get("https://api.odds-api.io/v3/sports",
+                params={"apiKey": ODDSAPI_KEY}, timeout=10)
+            out["sports_status"] = rs.status_code
+            try: out["sports_list"] = rs.json()
+            except: out["sports_text"] = rs.text[:1000]
+        except Exception as se:
+            out["sports_error"] = str(se)
+
         # Step 1: try to get events
         r = requests.get("https://api.odds-api.io/v3/events",
-            params={"apiKey": ODDSAPI_KEY, "sport": "soccer", "status": "live", "limit": 10},
+            params={"apiKey": ODDSAPI_KEY, "sport": "football", "status": "live", "limit": 10},
             timeout=15)
         out["events_status"] = r.status_code
         out["events_url"] = r.url
