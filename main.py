@@ -179,6 +179,31 @@ def init_db():
             goal_2m BOOLEAN DEFAULT FALSE, goal_5m BOOLEAN DEFAULT FALSE,
             goal_10m BOOLEAN DEFAULT FALSE
         )""")
+        # ── Critical direct migrations ──────────────────────────────────────
+        for q in [
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS home_team  TEXT DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS away_team  TEXT DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS league     TEXT DEFAULT ''",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS minute     INT DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS score_home INT DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS score_away INT DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS total_goals INT DEFAULT 0",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS period     TEXT DEFAULT 'FT'",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS status     TEXT DEFAULT 'live'",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS event_id   TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS rule_id INT DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS rule_name TEXT DEFAULT ''",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_score_home INT DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_score_away INT DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_total_goals INT DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS failure_reason TEXT",
+            # goals table — add TEXT match_id if missing (old schema had integer)
+            "ALTER TABLE goals ADD COLUMN IF NOT EXISTS match_id_text TEXT",
+        ]:
+            try: conn.run(q)
+            except Exception as ce: log.debug(f"Migration: {ce}")
+
         # Safe migrations — add missing columns to existing tables
         _safe_migrate(conn)
 
@@ -682,7 +707,7 @@ def check_rules(conn, match_id, home, away, league, minute, score_h, score_a, pe
                     n=gap,o=pres,p=confidence,q=val_window)
 
                 # Update rule total_signals
-                conn.run("UPDATE rules SET total_signals=total_signals+1,last_updated=NOW() WHERE id=:a", a=rid)
+                conn.run("UPDATE rules SET total_signals=total_signals+1,last_updated_at=NOW() WHERE id=:a", a=rid)
 
                 log.info(f"🎯 SIGNAL: {rname} | {home} vs {away} | {mtype} {line} {side} @ {entry_odd} min:{minute}")
             except Exception as e:
@@ -777,13 +802,13 @@ def validate_trades(conn):
                     if result=="win":
                         conn.run("""UPDATE rules SET win_count=win_count+1,
                             win_rate=ROUND((win_count+1)::float/(win_count+lose_count+1)*100,1),
-                            dummy_profit=dummy_profit+:a, last_updated=NOW() WHERE id=:b""",
+                            dummy_profit=dummy_profit+:a, last_updated_at=NOW() WHERE id=:b""",
                             a=profit, b=rid)
                     else:
                         conn.run("""UPDATE rules SET lose_count=lose_count+1,
                             win_rate=CASE WHEN (win_count+lose_count+1)>0
                                 THEN ROUND(win_count::float/(win_count+lose_count+1)*100,1) ELSE 0 END,
-                            dummy_profit=dummy_profit+:a, last_updated=NOW() WHERE id=:b""",
+                            dummy_profit=dummy_profit+:a, last_updated_at=NOW() WHERE id=:b""",
                             a=profit, b=rid)
                 except: pass
                 log.info(f"{'✅' if result=='win' else '❌'} {rname} {result} | profit:{profit}")
@@ -864,14 +889,14 @@ def validate_trades(conn):
                     if result == "win":
                         conn.run("""UPDATE rules SET win_count=win_count+1,
                             win_rate=ROUND((win_count+1)::float/(win_count+lose_count+1)*100,1),
-                            dummy_profit=dummy_profit+:a, last_updated=NOW()
+                            dummy_profit=dummy_profit+:a, last_updated_at=NOW()
                             WHERE id=:b""", a=profit, b=rid)
                     else:
                         conn.run("""UPDATE rules SET lose_count=lose_count+1,
                             win_rate=CASE WHEN (win_count+lose_count+1)>0
                                 THEN ROUND(win_count::float/(win_count+lose_count+1)*100,1)
                                 ELSE 0 END,
-                            dummy_profit=dummy_profit+:a, last_updated=NOW()
+                            dummy_profit=dummy_profit+:a, last_updated_at=NOW()
                             WHERE id=:b""", a=profit, b=rid)
                 except: pass
 
@@ -929,12 +954,12 @@ def collect():
                 try:
                     conn.run("""INSERT INTO matches
                         (match_id,event_id,league,home_team,away_team,minute,
-                         score_home,score_away,total_goals,period,status,last_updated)
+                         score_home,score_away,total_goals,period,status,last_updated_at)
                         VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,NOW())
                         ON CONFLICT (match_id) DO UPDATE SET
                         league=:c,home_team=:d,away_team=:e,
                         minute=:f,score_home=:g,score_away=:h,
-                        total_goals=:i,period=:j,status=:k,last_updated=NOW()""",
+                        total_goals=:i,period=:j,status=:k,last_updated_at=NOW()""",
                         a=match_id,b=eid,c=league,d=home,e=away,f=minute,
                         g=score_h,h=score_a,i=total,
                         j=period,k='live')
@@ -957,10 +982,10 @@ def collect():
                             if k not in snap_dict:
                                 snap_dict[k] = {"over": s[2], "under": s[3]}
                         conn.run("""INSERT INTO goals
-                            (match_id,minute,goal_time,score_before,score_after,period,
+                            (match_id_text,minute,goal_time,score_before,score_after,period,
                              auto_detected,had_snapshots,odds_30s,odds_60s)
                             VALUES (:a,:b,:c,:d,:e,:f,TRUE,:g,:h,:i)""",
-                            a=match_id, b=minute,
+                            a=str(match_id), b=minute,
                             c=str(goal_time),
                             d=str(prev_goals), e=f"{score_h}-{score_a}",
                             f=period, g=bool(snap_dict),
@@ -1580,15 +1605,15 @@ def api_matches():
         try:
             # Try live first, fallback to all recent
             rows=conn.run("""SELECT match_id,home_team,away_team,league,
-                minute,score_home,score_away,total_goals,period,status,last_updated
-                FROM matches WHERE last_updated>NOW()-INTERVAL '10 minutes'
-                ORDER BY last_updated DESC LIMIT 100""")
+                minute,score_home,score_away,total_goals,period,status,last_updated_at
+                FROM matches WHERE last_updated_at>NOW()-INTERVAL '10 minutes'
+                ORDER BY last_updated_at DESC LIMIT 100""")
             return jsonify([{
                 "match_id":r[0],"home_team":r[1]or"","away_team":r[2]or"",
                 "league":r[3]or"","minute":r[4]or 0,
                 "score_home":r[5]or 0,"score_away":r[6]or 0,
                 "total_goals":r[7]or 0,"period":r[8]or"FT",
-                "status":r[9]or"","last_updated":str(r[10])
+                "status":r[9]or"","last_updated_at":str(r[10])
             } for r in rows])
         finally: conn.close()
     except Exception as e:
@@ -1600,7 +1625,7 @@ def api_stats():
     try:
         conn=get_db()
         try:
-            r1=conn.run("SELECT COUNT(*) FROM matches WHERE last_updated>NOW()-INTERVAL '3 minutes'")
+            r1=conn.run("SELECT COUNT(*) FROM matches WHERE last_updated_at>NOW()-INTERVAL '3 minutes'")
             r2=conn.run("SELECT COUNT(*) FROM observations WHERE detected_at>NOW()-INTERVAL '30 minutes'")
             r3=conn.run("SELECT COUNT(*) FROM goals WHERE goal_time>NOW()-INTERVAL '24 hours'")
             r4=conn.run("SELECT COUNT(*) FROM paper_trades WHERE result='pending'")
@@ -1635,10 +1660,10 @@ def api_goals():
     try:
         conn=get_db()
         try:
-            rows=conn.run("""SELECT g.match_id,g.minute,g.score_before,g.score_after,
+            rows=conn.run("""SELECT g.match_id_text,g.minute,g.score_before,g.score_after,
                 g.had_snapshots,g.odds_30s,g.odds_60s,g.goal_time,g.period,
                 m.home_team,m.away_team,m.league
-                FROM goals g LEFT JOIN matches m ON g.match_id=m.match_id
+                FROM goals g LEFT JOIN matches m ON g.match_id_text=m.match_id
                 ORDER BY g.goal_time DESC LIMIT 50""")
             result=[]
             for r in rows:
@@ -1724,7 +1749,7 @@ def api_rules_toggle():
         data=request.json
         conn=get_db()
         try:
-            conn.run("UPDATE rules SET is_active=:a,last_updated=NOW() WHERE rule_name=:b",
+            conn.run("UPDATE rules SET is_active=:a,last_updated_at=NOW() WHERE rule_name=:b",
                 a=data["is_active"],b=data["rule_name"])
             return jsonify({"status":"ok"})
         finally: conn.close()
