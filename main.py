@@ -894,8 +894,12 @@ def collect():
                 period   = parsed["period"]
                 markets  = parsed["markets"]
                 total    = score_h + score_a
-                is_live  = bool(odds_data) or minute > 0
+                is_live = True  # all events from fetch_events() are live by definition
                 if is_live: live_cnt += 1
+
+                # Debug: log first event structure once to understand API format
+                if live_cnt == 1 and len(markets) == 0:
+                    log.info(f"🔍 Event sample: {json.dumps(event)[:500]}")
 
                 match_id = f"oa_{eid}"
 
@@ -1026,8 +1030,8 @@ def collect():
                     except Exception as e:
                         log.debug(f"Snapshot save: {e}")
 
-                # Check rules for live matches
-                if is_live and markets:
+                # Check rules only if we have market data
+                if markets:
                     check_rules(conn, match_id, home, away, league,
                                minute, score_h, score_a, period, markets, held_map)
 
