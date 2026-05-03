@@ -122,8 +122,15 @@ def _safe_migrate(conn):
         # matches
         ("matches", "match_id",                  "TEXT"),
         ("matches", "event_id",                  "TEXT"),
+        ("matches", "home_team",                 "TEXT DEFAULT ''"),
+        ("matches", "away_team",                 "TEXT DEFAULT ''"),
+        ("matches", "league",                    "TEXT DEFAULT ''"),
         ("matches", "total_goals",               "INT DEFAULT 0"),
         ("matches", "period",                    "TEXT DEFAULT 'FT'"),
+        ("matches", "minute",                    "INT DEFAULT 0"),
+        ("matches", "score_home",                "INT DEFAULT 0"),
+        ("matches", "score_away",                "INT DEFAULT 0"),
+        ("matches", "status",                    "TEXT DEFAULT 'live'"),
     ]
     for table, col, col_type in migrations:
         try:
