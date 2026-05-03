@@ -361,16 +361,19 @@ def set_opening(mid, mtype, line, over, under):
 
 # ─── OddsAPI.io ───────────────────────────────────────────────────────────────
 def fetch_events():
-    if not ODDSAPI_KEY: return []
+    if not ODDSAPI_KEY:
+        log.warning("⚠️ ODDSAPI_KEY not set!")
+        return []
     try:
         r = requests.get("https://api.odds-api.io/v3/events",
-            params={"apiKey": ODDSAPI_KEY, "sport": "football", "status": "live", "limit": 50},
+            params={"apiKey": ODDSAPI_KEY, "sport": "soccer", "status": "live", "limit": 50},
             timeout=15)
         if r.status_code != 200:
-            log.warning(f"OddsAPI events: {r.status_code}")
+            log.warning(f"OddsAPI events HTTP {r.status_code}: {r.text[:300]}")
             return []
         raw = r.json()
-        events = raw if isinstance(raw, list) else raw.get("data") or raw.get("events") or []
+        events = raw if isinstance(raw, list) else (
+            raw.get("data") or raw.get("events") or raw.get("results") or [])
         log.info(f"📡 OddsAPI: {len(events)} live events")
         return events
     except Exception as e:
@@ -1737,24 +1740,54 @@ def health():
 
 @app.route("/api/debug_odds")
 def api_debug_odds():
-    """Show raw API response for the first live event – for diagnosing parse issues"""
+    """Show raw API response — for diagnosing parse/auth issues"""
+    out = {"api_key_set": bool(ODDSAPI_KEY), "api_key_prefix": ODDSAPI_KEY[:8]+"..." if ODDSAPI_KEY else "MISSING"}
     try:
-        events = fetch_events()
-        if not events:
-            return jsonify({"error": "No live events from API"})
-        eid = str(events[0].get("id") or events[0].get("eventId") or "")
-        odds_batch = fetch_odds_multi([eid]) if eid else []
-        odds_raw = odds_batch[0] if odds_batch else {}
-        parsed = parse_event(events[0], odds_raw)
-        return jsonify({
-            "event_raw": events[0],
-            "odds_raw": odds_raw,
-            "parsed": parsed,
-            "markets_found": len(parsed.get("markets", [])),
-            "total_events": len(events)
-        })
+        # Step 1: try to get events
+        r = requests.get("https://api.odds-api.io/v3/events",
+            params={"apiKey": ODDSAPI_KEY, "sport": "soccer", "status": "live", "limit": 10},
+            timeout=15)
+        out["events_status"] = r.status_code
+        out["events_url"] = r.url
+        try: out["events_raw"] = r.json()
+        except: out["events_raw_text"] = r.text[:2000]
+
+        events_list = []
+        raw = out["events_raw"] if "events_raw" in out else {}
+        if isinstance(raw, list): events_list = raw
+        elif isinstance(raw, dict):
+            events_list = raw.get("data") or raw.get("events") or raw.get("results") or []
+
+        out["events_count"] = len(events_list)
+
+        # Step 2: if we have events, get odds for first one
+        if events_list:
+            eid = str(events_list[0].get("id") or events_list[0].get("eventId") or "")
+            out["first_event"] = events_list[0]
+            if eid:
+                r2 = requests.get("https://api.odds-api.io/v3/odds",
+                    params={"apiKey": ODDSAPI_KEY, "eventId": eid},
+                    timeout=15)
+                out["odds_status"] = r2.status_code
+                out["odds_url"] = r2.url
+                try: out["odds_raw"] = r2.json()
+                except: out["odds_raw_text"] = r2.text[:2000]
+
+                parsed = parse_event(events_list[0], out.get("odds_raw", {}))
+                out["parsed"] = parsed
+                out["markets_found"] = len(parsed.get("markets", []))
+        else:
+            out["note"] = "No events — trying without status filter"
+            r3 = requests.get("https://api.odds-api.io/v3/events",
+                params={"apiKey": ODDSAPI_KEY, "sport": "soccer", "limit": 5},
+                timeout=15)
+            out["no_filter_status"] = r3.status_code
+            try: out["no_filter_raw"] = r3.json()
+            except: out["no_filter_text"] = r3.text[:2000]
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        out["error"] = str(e)
+    return jsonify(out)
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 init_db()
