@@ -93,9 +93,35 @@ def _safe_migrate(conn):
         ("rules", "score_condition",             "TEXT"),
         # paper_trades
         ("paper_trades", "observation_id",       "INT"),
+        ("paper_trades", "rule_id",              "INT DEFAULT 0"),
+        ("paper_trades", "rule_name",            "TEXT DEFAULT ''"),
         ("paper_trades", "confidence_estimate",  "INT DEFAULT 50"),
         ("paper_trades", "movement_type",        "TEXT"),
         ("paper_trades", "failure_reason",       "TEXT"),
+        ("paper_trades", "entry_minute",         "INT DEFAULT 0"),
+        ("paper_trades", "entry_score_home",     "INT DEFAULT 0"),
+        ("paper_trades", "entry_score_away",     "INT DEFAULT 0"),
+        ("paper_trades", "entry_total_goals",    "INT DEFAULT 0"),
+        ("paper_trades", "score_entry",          "TEXT DEFAULT '0-0'"),
+        ("paper_trades", "home_team",            "TEXT DEFAULT ''"),
+        ("paper_trades", "away_team",            "TEXT DEFAULT ''"),
+        ("paper_trades", "league",               "TEXT DEFAULT ''"),
+        ("paper_trades", "market_type",          "TEXT DEFAULT 'FT'"),
+        ("paper_trades", "line",                 "FLOAT DEFAULT 2.5"),
+        ("paper_trades", "selected_side",        "TEXT DEFAULT 'over'"),
+        ("paper_trades", "action_type",          "TEXT DEFAULT ''"),
+        ("paper_trades", "entry_odd",            "FLOAT DEFAULT 0"),
+        ("paper_trades", "expected_odd",         "FLOAT"),
+        ("paper_trades", "gap",                  "FLOAT DEFAULT 0"),
+        ("paper_trades", "pressure_score",       "INT DEFAULT 0"),
+        ("paper_trades", "validation_window",    "TEXT DEFAULT '10m'"),
+        ("paper_trades", "dummy_stake",          "FLOAT DEFAULT 100"),
+        ("paper_trades", "dummy_profit_loss",    "FLOAT DEFAULT 0"),
+        # matches
+        ("matches", "match_id",                  "TEXT"),
+        ("matches", "event_id",                  "TEXT"),
+        ("matches", "total_goals",               "INT DEFAULT 0"),
+        ("matches", "period",                    "TEXT DEFAULT 'FT'"),
     ]
     for table, col, col_type in migrations:
         try:
@@ -642,10 +668,13 @@ def check_rules(conn, match_id, home, away, league, minute, score_h, score_a, pe
 def validate_trades(conn):
     """Resolve pending paper trades"""
     try:
-        pending = conn.run("""SELECT id, match_id, rule_id, rule_name,
-            action_type, validation_window, entry_odd, selected_side,
-            market_type, line, created_at,
-            entry_score_home, entry_score_away, entry_total_goals
+        pending = conn.run("""SELECT id, match_id,
+            COALESCE(rule_id, 0), COALESCE(rule_name, ''),
+            COALESCE(action_type, ''), COALESCE(validation_window, '10m'),
+            COALESCE(entry_odd, 1.0), COALESCE(selected_side, 'over'),
+            COALESCE(market_type, 'FT'), COALESCE(line, 2.5), created_at,
+            COALESCE(entry_score_home, 0), COALESCE(entry_score_away, 0),
+            COALESCE(entry_total_goals, 0)
             FROM paper_trades WHERE result='pending'""")
 
         for p in pending:
