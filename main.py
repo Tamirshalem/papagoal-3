@@ -92,7 +92,9 @@ def _safe_migrate(conn):
         ("rules", "movement_condition",          "TEXT"),
         ("rules", "score_condition",             "TEXT"),
         # paper_trades
-        ("paper_trades", "observation_id",       "INT"),
+        ("paper_trades", "created_at",          "TIMESTAMPTZ DEFAULT NOW()"),
+        ("paper_trades", "resolved_at",         "TIMESTAMPTZ"),
+        ("paper_trades", "result",               "TEXT DEFAULT 'pending'"),
         ("paper_trades", "rule_id",              "INT DEFAULT 0"),
         ("paper_trades", "rule_name",            "TEXT DEFAULT ''"),
         ("paper_trades", "confidence_estimate",  "INT DEFAULT 50"),
@@ -668,14 +670,18 @@ def check_rules(conn, match_id, home, away, league, minute, score_h, score_a, pe
 def validate_trades(conn):
     """Resolve pending paper trades"""
     try:
-        pending = conn.run("""SELECT id, match_id,
-            COALESCE(rule_id, 0), COALESCE(rule_name, ''),
-            COALESCE(action_type, ''), COALESCE(validation_window, '10m'),
-            COALESCE(entry_odd, 1.0), COALESCE(selected_side, 'over'),
-            COALESCE(market_type, 'FT'), COALESCE(line, 2.5), created_at,
-            COALESCE(entry_score_home, 0), COALESCE(entry_score_away, 0),
-            COALESCE(entry_total_goals, 0)
-            FROM paper_trades WHERE result='pending'""")
+        try:
+            pending = conn.run("""SELECT id, match_id,
+                COALESCE(rule_id, 0), COALESCE(rule_name, ''),
+                COALESCE(action_type, ''), COALESCE(validation_window, '10m'),
+                COALESCE(entry_odd, 1.0), COALESCE(selected_side, 'over'),
+                COALESCE(market_type, 'FT'), COALESCE(line, 2.5), created_at,
+                COALESCE(entry_score_home, 0), COALESCE(entry_score_away, 0),
+                COALESCE(entry_total_goals, 0)
+                FROM paper_trades WHERE result='pending'""")
+        except Exception as eq:
+            log.warning(f"Validate trades SELECT failed (skipping): {eq}")
+            return
 
         for p in pending:
             (tid, mid, rid, rname, action_type, val_window, entry_odd, side,
