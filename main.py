@@ -382,20 +382,22 @@ def fetch_events():
 
 def fetch_odds_multi(event_ids):
     if not event_ids or not ODDSAPI_KEY: return []
-    try:
-        r = requests.get("https://api.odds-api.io/v3/odds/multi",
-            params={"apiKey": ODDSAPI_KEY,
-                   "eventIds": ",".join(str(x) for x in event_ids[:10]),
-                   "bookmakers": "Bet365"},
-            timeout=15)
-        if r.status_code != 200:
-            log.warning(f"OddsAPI odds: {r.status_code}")
-            return []
-        raw = r.json()
-        return raw if isinstance(raw, list) else raw.get("data") or []
-    except Exception as e:
-        log.error(f"OddsAPI odds: {e}")
-        return []
+    results = []
+    for eid in event_ids[:20]:
+        try:
+            r = requests.get(f"https://api.odds-api.io/v3/events/{eid}/odds",
+                params={"apiKey": ODDSAPI_KEY},
+                timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data and not data.get("error"):
+                    data["_event_id"] = str(eid)
+                    results.append(data)
+            elif r.status_code != 404:
+                log.debug(f"Odds {eid}: {r.status_code} {r.text[:100]}")
+        except Exception as e:
+            log.debug(f"Odds fetch {eid}: {e}")
+    return results
 
 def parse_event(event, odds_data):
     """Parse event + odds into structured format"""
@@ -634,7 +636,7 @@ def validate_trades(conn):
             pt.action_type, pt.validation_window, pt.entry_odd, pt.selected_side,
             pt.market_type, pt.line, pt.created_at,
             m.score_home, m.score_away, m.minute, m.period, m.total_goals
-            FROM paper_trades pt JOIN matches m ON pt.match_id=m.match_id
+            FROM paper_trades pt LEFT JOIN matches m ON pt.match_id=m.match_id
             WHERE pt.result='pending'""")
 
         for p in pending:
@@ -1775,8 +1777,8 @@ def api_debug_odds():
             eid = str(events_list[0].get("id") or events_list[0].get("eventId") or "")
             out["first_event"] = events_list[0]
             if eid:
-                r2 = requests.get("https://api.odds-api.io/v3/odds",
-                    params={"apiKey": ODDSAPI_KEY, "eventId": eid},
+                r2 = requests.get(f"https://api.odds-api.io/v3/events/{eid}/odds",
+                    params={"apiKey": ODDSAPI_KEY},
                     timeout=15)
                 out["odds_status"] = r2.status_code
                 out["odds_url"] = r2.url
