@@ -381,22 +381,32 @@ def fetch_events():
         return []
 
 def fetch_odds_multi(event_ids):
+    """Try multiple odds endpoint patterns until one works"""
     if not event_ids or not ODDSAPI_KEY: return []
     results = []
-    for eid in event_ids[:20]:
-        try:
-            r = requests.get(f"https://api.odds-api.io/v3/events/{eid}/odds",
-                params={"apiKey": ODDSAPI_KEY},
-                timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if data and not data.get("error"):
-                    data["_event_id"] = str(eid)
-                    results.append(data)
-            elif r.status_code != 404:
-                log.debug(f"Odds {eid}: {r.status_code} {r.text[:100]}")
-        except Exception as e:
-            log.debug(f"Odds fetch {eid}: {e}")
+    for eid in event_ids[:30]:
+        data = None
+        # Try endpoint patterns in order
+        endpoints = [
+            f"https://api.odds-api.io/v3/events/{eid}/odds",
+            f"https://api.odds-api.io/v3/odds?eventId={eid}",
+        ]
+        for url in endpoints:
+            try:
+                r = requests.get(url, params={"apiKey": ODDSAPI_KEY}, timeout=8)
+                if r.status_code == 200:
+                    d = r.json()
+                    if d and not d.get("error"):
+                        d["_event_id"] = str(eid)
+                        data = d
+                        break
+                elif r.status_code not in (404, 400):
+                    log.debug(f"Odds {eid} {url}: {r.status_code} {r.text[:80]}")
+            except: pass
+        if data:
+            results.append(data)
+    if results:
+        log.info(f"📊 Odds loaded: {len(results)}/{len(event_ids[:30])} events")
     return results
 
 def parse_event(event, odds_data):
@@ -632,12 +642,96 @@ def check_rules(conn, match_id, home, away, league, minute, score_h, score_a, pe
 def validate_trades(conn):
     """Resolve pending paper trades"""
     try:
-        pending = conn.run("""SELECT pt.id, pt.match_id, pt.rule_id, pt.rule_name,
-            pt.action_type, pt.validation_window, pt.entry_odd, pt.selected_side,
-            pt.market_type, pt.line, pt.created_at,
-            m.score_home, m.score_away, m.minute, m.period, m.total_goals
-            FROM paper_trades pt LEFT JOIN matches m ON pt.match_id=m.match_id
-            WHERE pt.result='pending'""")
+        pending = conn.run("""SELECT id, match_id, rule_id, rule_name,
+            action_type, validation_window, entry_odd, selected_side,
+            market_type, line, created_at,
+            entry_score_home, entry_score_away, entry_total_goals
+            FROM paper_trades WHERE result='pending'""")
+
+        for p in pending:
+            (tid, mid, rid, rname, action_type, val_window, entry_odd, side,
+             mtype, line, created_at, entry_h, entry_a, entry_total) = p
+
+            # Fetch current match state separately
+            try:
+                mrow = conn.run("""SELECT score_home, score_away, minute, period, total_goals
+                    FROM matches WHERE match_id=:a LIMIT 1""", a=mid)
+                if mrow:
+                    cur_h, cur_a, cur_min, cur_period, cur_goals = mrow[0]
+                else:
+                    cur_h, cur_a, cur_min, cur_period, cur_goals = 0, 0, 0, "FT", 0
+            except:
+                cur_h, cur_a, cur_min, cur_period, cur_goals = 0, 0, 0, "FT", 0
+
+            now = datetime.now(timezone.utc)
+            created = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+            elapsed_min = (now - created).total_seconds() / 60
+
+            result = None
+            failure_reason = None
+            profit = 0
+
+            total_now = (cur_h or 0) + (cur_a or 0)
+            entry_total = int(entry_total or 0)
+            goals_since = max(0, total_now - entry_total)
+            line_crossed = total_now > float(line or 0)
+
+            if action_type == "OVER_LINE_WITHIN_10M":
+                if goals_since > 0 and line_crossed:
+                    result = "win"
+                elif elapsed_min > 12:
+                    result = "lose"; failure_reason = "No goal / line not crossed in 10min"
+
+            elif action_type == "UNDER_HOLDS_10M":
+                if goals_since > 0 and line_crossed:
+                    result = "lose"; failure_reason = "Line crossed"
+                elif elapsed_min > 12:
+                    result = "win"
+
+            elif action_type in ("H1_OVER_LINE_BEFORE_HT", "H1_GOAL_BEFORE_HT"):
+                ht_done = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
+                if ht_done:
+                    result = "win" if line_crossed else "lose"
+                    if result=="lose": failure_reason = "Line not crossed by HT"
+                elif elapsed_min > 65:
+                    result = "lose"; failure_reason = "HT timeout"
+
+            elif action_type == "UNDER_HOLDS_TO_HT":
+                ht_done = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
+                if ht_done:
+                    result = "win" if goals_since==0 else "lose"
+                    if result=="lose": failure_reason = "Goal scored before HT"
+                elif elapsed_min > 65:
+                    result = "lose"; failure_reason = "HT timeout"
+
+            elif action_type in ("OVER_LINE_BEFORE_FT","GOAL_BY_FT"):
+                if cur_period == "FT":
+                    result = "win" if line_crossed else "lose"
+                    if result=="lose": failure_reason = "Line not crossed by FT"
+                elif elapsed_min > 35:
+                    result = "lose"; failure_reason = "FT timeout"
+
+            if result:
+                profit = round((float(entry_odd or 1)-1)*100, 2) if result=="win" else -100.0
+                conn.run("""UPDATE paper_trades SET result=:a, resolved_at=NOW(),
+                    dummy_profit_loss=:b, failure_reason=:c WHERE id=:d""",
+                    a=result, b=profit, c=failure_reason, d=tid)
+                try:
+                    if result=="win":
+                        conn.run("""UPDATE rules SET win_count=win_count+1,
+                            win_rate=ROUND((win_count+1)::float/(win_count+lose_count+1)*100,1),
+                            dummy_profit=dummy_profit+:a, last_updated=NOW() WHERE id=:b""",
+                            a=profit, b=rid)
+                    else:
+                        conn.run("""UPDATE rules SET lose_count=lose_count+1,
+                            win_rate=CASE WHEN (win_count+lose_count+1)>0
+                                THEN ROUND(win_count::float/(win_count+lose_count+1)*100,1) ELSE 0 END,
+                            dummy_profit=dummy_profit+:a, last_updated=NOW() WHERE id=:b""",
+                            a=profit, b=rid)
+                except: pass
+                log.info(f"{'✅' if result=='win' else '❌'} {rname} {result} | profit:{profit}")
+    except Exception as e:
+        log.error(f"Validate trades: {e}")
 
         for p in pending:
             (tid, mid, rid, rname, action_type, val_window, entry_odd, side,
